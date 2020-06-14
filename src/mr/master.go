@@ -2,15 +2,46 @@ package mr
 
 import (
 	"log"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/rpc"
 	"os"
+	"sync"
 )
+
+// State of the Worker
+const (
+	IdleWorker = iota
+	BusyWorker = iota
+)
+
+// State of the Task
+const (
+	Completed = iota
+	Waiting   = iota
+	Running   = iota
+)
+
+type Task struct {
+	TaskId    int
+	Filenames []string
+	TaskState int
+	TaskType  int
+}
 
 type Master struct {
 	// Your definitions here.
+	mu sync.Mutex
 
+	nReduce int
+
+	workerIdGen      int // Generate Ids for workers
+	workersAvailable map[int]bool
+	workersStats     map[int]int
+
+	taskIdGen  int
+	tasksStats map[int]int
 }
 
 // Your code here -- RPC handlers for the worker to call.
@@ -25,8 +56,23 @@ func (m *Master) Example(args *ExampleArgs, reply *ExampleReply) error {
 	return nil
 }
 
-func (m *Master) ReadyWorker(args *WorkerMessage, reply *ExampleReply) error {
-	reply.Y = 1
+// Called by worker when started to get an ID
+func (m *Master) RegisterWorker(empty string, reply *WorkerIdReply) error {
+	m.mu.Lock()
+	reply.Id = m.workerIdGen
+	m.workersAvailable[m.workerIdGen] = true
+	m.workerIdGen++
+	m.mu.Unlock()
+	return nil
+}
+
+// Called by worker to get a task to work on (Map or Reduce)
+func (m *Master) GetTask(request *GetTaskRequest, reply *GetTaskReply) error {
+	if rand.Intn(50)%2 == 0 {
+		reply.TaskType = MapTask
+	} else {
+		reply.TaskType = ReduceTask
+	}
 	return nil
 }
 
@@ -67,6 +113,12 @@ func MakeMaster(files []string, nReduce int) *Master {
 	m := Master{}
 
 	// Your code here.
+	m.workerIdGen = 1
+	m.nReduce = nReduce
+	m.workersAvailable = make(map[int]bool)
+	m.workersStats = make(map[int]int)
+	m.taskIdGen = 1
+	m.tasksStats = make(map[int]int)
 
 	m.server()
 	return &m

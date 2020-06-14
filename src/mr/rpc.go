@@ -24,13 +24,31 @@ type ExampleReply struct {
 	Y int
 }
 
+const (
+	MapTask    = iota
+	ReduceTask = iota
+	//NoTask     = iota
+)
+
 // Add your RPC definitions here.
-type WorkerMessage struct {
-	X int
+type WorkerIdReply struct {
+	Id int
 }
 
-type ServerMessage struct {
-	Y int
+type GetTaskRequest struct {
+	WorkerId int
+}
+
+type GetTaskReply struct {
+	TaskType  int
+	TaskId    int
+	Filenames []string
+	NumReduce int
+}
+
+type TaskCompletedRequest struct {
+	WorkerId        int
+	FilenamesMapper map[int][]string // maps a reduce task to all files associated with it
 }
 
 // Cook up a unique-ish UNIX-domain socket name
