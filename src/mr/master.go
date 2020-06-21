@@ -211,7 +211,6 @@ func (m *Master) GenerateReduceTasks() {
 
 		m.mu.Lock()
 		m.taskIdMapper[task.TaskId] = &task
-
 		m.mu.Unlock()
 	}
 
@@ -257,8 +256,9 @@ func (m *Master) server() {
 // if the entire job has finished.
 //
 func (m *Master) Done() bool {
+	m.mu.Lock()
 	ret := m.completedReduceTasks == m.nReduce
-
+	m.mu.Unlock()
 	return ret
 }
 
