@@ -38,8 +38,8 @@ type Master struct {
 	mu       sync.Mutex
 
 	completedReduceTasks int
-	nReduce int
-	nMap    int
+	nReduce              int
+	nMap                 int
 
 	workerIdGen      int // Generate Ids for workers
 	workersAvailable map[int]bool
@@ -50,7 +50,7 @@ type Master struct {
 
 	intermediateFiles map[int][]string
 
-	outputFiles string[]
+	outputFiles []string
 }
 
 // Your code here -- RPC handlers for the worker to call.
@@ -102,6 +102,7 @@ func (m *Master) GetTask(request *GetTaskRequest, reply *GetTaskReply) error {
 	workerId := request.WorkerId
 
 	m.mu.Lock()
+	fmt.Println("MapLength:", len(m.taskIdMapper))
 	for _, task := range m.taskIdMapper {
 		if task.TaskState == Ready {
 			retTask = task
@@ -117,10 +118,12 @@ func (m *Master) GetTask(request *GetTaskRequest, reply *GetTaskReply) error {
 		reply.TaskType = None
 		return nil
 	}
+	fmt.Println("Returning a type", reply.TaskType, "task")
 
 	reply.TaskType = retTask.TaskType
 	reply.Filenames = retTask.Filenames
 	reply.TaskId = retTask.TaskId
+	reply.TaskIndex = retTask.TaskIndex
 	reply.NumReduce = m.nReduce
 	return nil
 }
@@ -139,7 +142,7 @@ func (m *Master) WorkerTaskCompleted(request *TaskCompletedRequest, reply *TaskC
 		task := m.taskIdMapper[taskId]
 
 		// Handling if worker detected as dead then reply received from it
-		if task.TaskState == Ready {
+		if task.TaskState == Running {
 			task.TaskState = Completed
 
 			for k, v := range request.FilenamesMapper {
@@ -154,7 +157,7 @@ func (m *Master) WorkerTaskCompleted(request *TaskCompletedRequest, reply *TaskC
 
 		m.mu.Unlock()
 
-		if mapCompleted == 0 {
+		if mapCompleted {
 			m.GenerateReduceTasks()
 		}
 
@@ -162,7 +165,7 @@ func (m *Master) WorkerTaskCompleted(request *TaskCompletedRequest, reply *TaskC
 		m.mu.Lock()
 		task := m.taskIdMapper[taskId]
 
-		// Handling if worker detected as dead then reply received from it
+		// Handling if worker detected as dead when reply received from it
 		if task.TaskState == Ready {
 			task.TaskState = Completed
 			m.outputFiles = append(m.outputFiles, request.ReduceOutputFile)
@@ -191,18 +194,24 @@ func (m *Master) GenerateMapTasks(filenames []string) {
 }
 
 func (m *Master) GenerateReduceTasks() {
+	fmt.Println("Generating Reduce Tasks ..")
+
 	for k, v := range m.intermediateFiles {
 		task := Task{}
 		task.TaskId = m.GenTaskId()
 		task.Filenames = v
 		task.TaskType = ReduceTask
+		task.TaskState = Ready
 		task.AssignedWorkerId = -1
 		task.TaskIndex = k
 
 		m.mu.Lock()
 		m.taskIdMapper[task.TaskId] = &task
+
 		m.mu.Unlock()
 	}
+
+	fmt.Println("Completed reduce tasks generation")
 }
 
 //
@@ -246,8 +255,8 @@ func MakeMaster(files []string, nReduce int) *Master {
 	m.nReduce = nReduce
 	m.workersAvailable = make(map[int]bool)
 	m.workersStats = make(map[int]int)
-	m.reduceIntermediateFiles = make(map[int][]string)
-	m.workerTaskMapper = make(map[int]*Task)
+	m.intermediateFiles = make(map[int][]string)
+	m.taskIdMapper = make(map[int]*Task)
 	m.taskIdGen = 1
 	m.completedReduceTasks = 0
 

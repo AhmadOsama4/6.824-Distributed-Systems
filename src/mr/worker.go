@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/rpc"
 	"os"
+	"time"
 )
 
 //
@@ -64,7 +65,7 @@ func Worker(mapf func(string, string) []KeyValue,
 
 		} else if reply.TaskType == ReduceTask {
 			fmt.Println("Received Reduce Task with Id:", reply.TaskId)
-			result := executeReduceTask(0, reply.Filenames, reducef)
+			result := executeReduceTask(reply.TaskIndex, reply.Filenames, reducef)
 
 			doneRequest := TaskCompletedRequest{}
 			doneReply := TaskCompletedReply{}
@@ -76,8 +77,8 @@ func Worker(mapf func(string, string) []KeyValue,
 
 			call("Master.WorkerTaskCompleted", &doneRequest, &doneReply)
 		}
-		break
-		//time.Sleep(time.Millisecond * 50)
+		//break
+		time.Sleep(time.Millisecond * 50)
 	}
 
 	// uncomment to send the Example RPC to the master.

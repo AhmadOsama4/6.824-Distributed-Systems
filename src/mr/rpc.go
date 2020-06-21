@@ -42,6 +42,7 @@ type GetTaskRequest struct {
 type GetTaskReply struct {
 	TaskType  int
 	TaskId    int
+	TaskIndex int
 	Filenames []string
 	NumReduce int
 }
