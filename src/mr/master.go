@@ -104,7 +104,6 @@ func (m *Master) GetTask(request *GetTaskRequest, reply *GetTaskReply) error {
 	workerId := request.WorkerId
 
 	m.mu.Lock()
-	fmt.Println("MapLength:", len(m.taskIdMapper))
 	for _, task := range m.taskIdMapper {
 		if task.TaskState == Ready {
 			retTask = task
@@ -124,8 +123,6 @@ func (m *Master) GetTask(request *GetTaskRequest, reply *GetTaskReply) error {
 	m.mu.Lock()
 	m.workersTiming[workerId] = time.Now()
 	m.mu.Unlock()
-
-	fmt.Println("Returning a type", reply.TaskType, "task")
 
 	reply.TaskType = retTask.TaskType
 	reply.Filenames = retTask.Filenames
@@ -173,7 +170,7 @@ func (m *Master) WorkerTaskCompleted(request *TaskCompletedRequest, reply *TaskC
 		task := m.taskIdMapper[taskId]
 
 		// Handling if worker detected as dead when reply received from it
-		if task.TaskState == Ready {
+		if task.TaskState == Running {
 			task.TaskState = Completed
 			m.outputFiles = append(m.outputFiles, request.ReduceOutputFile)
 			m.completedReduceTasks++
@@ -260,9 +257,7 @@ func (m *Master) server() {
 // if the entire job has finished.
 //
 func (m *Master) Done() bool {
-	ret := false
-
-	// Your code here.
+	ret := m.completedReduceTasks == m.nReduce
 
 	return ret
 }

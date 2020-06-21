@@ -47,7 +47,11 @@ func Worker(mapf func(string, string) []KeyValue,
 		request := GetTaskRequest{}
 		reply := GetTaskReply{}
 
-		call("Master.GetTask", &request, &reply)
+		succes := call("Master.GetTask", &request, &reply)
+		if !succes {
+			log.Fatalf("Cannot Connect to master")
+			break
+		}
 
 		if reply.TaskType == MapTask {
 			fmt.Println("Received Map Task with Id:", reply.TaskId)
@@ -61,7 +65,11 @@ func Worker(mapf func(string, string) []KeyValue,
 			doneRequest.TaskType = MapTask
 			doneRequest.WorkerId = workerId
 
-			call("Master.WorkerTaskCompleted", &doneRequest, &doneReply)
+			succes := call("Master.WorkerTaskCompleted", &doneRequest, &doneReply)
+			if !succes {
+				log.Fatalf("Cannot Connect to master")
+				break
+			}
 
 		} else if reply.TaskType == ReduceTask {
 			fmt.Println("Received Reduce Task with Id:", reply.TaskId)
@@ -75,7 +83,11 @@ func Worker(mapf func(string, string) []KeyValue,
 			doneRequest.TaskType = ReduceTask
 			doneRequest.WorkerId = workerId
 
-			call("Master.WorkerTaskCompleted", &doneRequest, &doneReply)
+			succes := call("Master.WorkerTaskCompleted", &doneRequest, &doneReply)
+			if !succes {
+				log.Fatalf("Cannot Connect to master")
+				break
+			}
 		}
 		//break
 		time.Sleep(time.Millisecond * 100)
