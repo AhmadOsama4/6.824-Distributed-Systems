@@ -8,12 +8,14 @@ import (
 	"net/rpc"
 	"os"
 	"sync"
+	"time"
 )
 
 // State of the Worker
 const (
-	IdleWorker = iota
-	BusyWorker = iota
+	Idle = iota
+	Busy = iota
+	Dead = iota
 )
 
 // State of the Task
@@ -41,9 +43,9 @@ type Master struct {
 	nReduce              int
 	nMap                 int
 
-	workerIdGen      int // Generate Ids for workers
-	workersAvailable map[int]bool
-	workersStats     map[int]int
+	workerIdGen   int // Generate Ids for workers
+	workersStates map[int]int
+	workersTiming map[int]time.Time
 
 	taskIdGen    int
 	taskIdMapper map[int]*Task
@@ -90,7 +92,7 @@ func (m *Master) RegisterWorker(empty string, reply *WorkerIdReply) error {
 	workerId := m.GenWorkerId()
 	reply.Id = workerId
 	m.mu.Lock()
-	m.workersAvailable[workerId] = true
+	m.workersStates[workerId] = Idle
 	m.mu.Unlock()
 	return nil
 }
@@ -118,6 +120,11 @@ func (m *Master) GetTask(request *GetTaskRequest, reply *GetTaskReply) error {
 		reply.TaskType = None
 		return nil
 	}
+
+	m.mu.Lock()
+	m.workersTiming[workerId] = time.Now()
+	m.mu.Unlock()
+
 	fmt.Println("Returning a type", reply.TaskType, "task")
 
 	reply.TaskType = retTask.TaskType
@@ -214,6 +221,24 @@ func (m *Master) GenerateReduceTasks() {
 	fmt.Println("Completed reduce tasks generation")
 }
 
+func (m *Master) HandleWorkersTimeout() {
+	for {
+		m.mu.Lock()
+		for workerId, startTime := range m.workersTiming {
+			if time.Now().Sub(startTime) > time.Second*10 {
+				for _, task := range m.taskIdMapper {
+					if task.TaskState == Running && task.AssignedWorkerId == workerId {
+						(*task).TaskState = Ready
+						break
+					}
+				}
+			}
+		}
+		m.mu.Unlock()
+		time.Sleep(time.Millisecond * 500)
+	}
+}
+
 //
 // start a thread that listens for RPCs from worker.go
 //
@@ -253,14 +278,16 @@ func MakeMaster(files []string, nReduce int) *Master {
 	// Your code here.
 	m.workerIdGen = 1
 	m.nReduce = nReduce
-	m.workersAvailable = make(map[int]bool)
-	m.workersStats = make(map[int]int)
+	m.workersStates = make(map[int]int)
 	m.intermediateFiles = make(map[int][]string)
 	m.taskIdMapper = make(map[int]*Task)
+	m.workersTiming = make(map[int]time.Time)
 	m.taskIdGen = 1
 	m.completedReduceTasks = 0
 
 	m.GenerateMapTasks(files)
+	go m.HandleWorkersTimeout()
+
 	m.server()
 	return &m
 }

@@ -78,7 +78,7 @@ func Worker(mapf func(string, string) []KeyValue,
 			call("Master.WorkerTaskCompleted", &doneRequest, &doneReply)
 		}
 		//break
-		time.Sleep(time.Millisecond * 50)
+		time.Sleep(time.Millisecond * 100)
 	}
 
 	// uncomment to send the Example RPC to the master.
