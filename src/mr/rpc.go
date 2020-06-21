@@ -27,7 +27,7 @@ type ExampleReply struct {
 const (
 	MapTask    = iota
 	ReduceTask = iota
-	//NoTask     = iota
+	None       = iota
 )
 
 // Add your RPC definitions here.
@@ -47,8 +47,14 @@ type GetTaskReply struct {
 }
 
 type TaskCompletedRequest struct {
-	WorkerId        int
-	FilenamesMapper map[int][]string // maps a reduce task to all files associated with it
+	WorkerId         int
+	TaskId           int
+	TaskType         int
+	ReduceOutputFile string
+	FilenamesMapper  map[int]string // maps a reduceIndex to its filename
+}
+
+type TaskCompletedReply struct {
 }
 
 // Cook up a unique-ish UNIX-domain socket name

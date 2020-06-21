@@ -1,13 +1,13 @@
 package mr
 
 import (
+	"bufio"
 	"fmt"
 	"hash/fnv"
 	"io/ioutil"
 	"log"
 	"net/rpc"
 	"os"
-	"time"
 )
 
 //
@@ -35,7 +35,7 @@ func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
 	// Your worker implementation here.
-	CallExample()
+	//CallExample()
 	idArgs := WorkerIdReply{}
 	//args := ExampleArgs{}
 	call("Master.RegisterWorker", "", &idArgs)
@@ -47,15 +47,37 @@ func Worker(mapf func(string, string) []KeyValue,
 		reply := GetTaskReply{}
 
 		call("Master.GetTask", &request, &reply)
-		fmt.Printf("Received a %v task", reply.TaskType)
 
 		if reply.TaskType == MapTask {
+			fmt.Println("Received Map Task with Id:", reply.TaskId)
+			result := executeMapTask(workerId, reply.TaskId, reply.Filenames, reply.NumReduce, mapf)
+
+			doneRequest := TaskCompletedRequest{}
+			doneReply := TaskCompletedReply{}
+
+			doneRequest.TaskId = reply.TaskId
+			doneRequest.FilenamesMapper = result
+			doneRequest.TaskType = MapTask
+			doneRequest.WorkerId = workerId
+
+			call("Master.WorkerTaskCompleted", &doneRequest, &doneReply)
 
 		} else if reply.TaskType == ReduceTask {
+			fmt.Println("Received Reduce Task with Id:", reply.TaskId)
+			result := executeReduceTask(0, reply.Filenames, reducef)
 
+			doneRequest := TaskCompletedRequest{}
+			doneReply := TaskCompletedReply{}
+
+			doneRequest.TaskId = reply.TaskId
+			doneRequest.ReduceOutputFile = result
+			doneRequest.TaskType = ReduceTask
+			doneRequest.WorkerId = workerId
+
+			call("Master.WorkerTaskCompleted", &doneRequest, &doneReply)
 		}
-
-		time.Sleep(time.Millisecond * 50)
+		break
+		//time.Sleep(time.Millisecond * 50)
 	}
 
 	// uncomment to send the Example RPC to the master.
@@ -66,9 +88,10 @@ func executeMapTask(
 	workerId int,
 	taskId int,
 	filenames []string,
-	mapf func(string, string) []KeyValue) map[int][]string {
+	numReduce int,
+	mapf func(string, string) []KeyValue) map[int]string {
 
-	intermediateFilesMapper := make(map[int][]string)
+	intermediateFilesMapper := make(map[int]string)
 	kvTotal := make([]KeyValue, 0)
 
 	for _, filename := range filenames {
@@ -85,21 +108,21 @@ func executeMapTask(
 		kvTotal = append(kvTotal, kva...)
 	}
 
-	mapper := make(map[string][]string)
+	mapper := make(map[int][]KeyValue)
 
 	for _, item := range kvTotal {
-		mapper[item.Key] = append(mapper[item.Key], item.Value)
+		rTaskIndex := ihash(item.Key) % numReduce
+		mapper[rTaskIndex] = append(mapper[rTaskIndex], item)
 	}
 
-	for k, valueList := range mapper {
-		rTask := ihash(k)
-		filename := fmt.Sprintf("mr-%d-%d-%d", workerId, rTask, taskId)
+	for rTaskIndex, kvList := range mapper {
+		filename := fmt.Sprintf("mr-intermediate-%d-%d", rTaskIndex, taskId)
 		ofile, _ := os.Create(filename)
 
-		intermediateFilesMapper[rTask] = append(intermediateFilesMapper[rTask], filename)
+		intermediateFilesMapper[rTaskIndex] = filename
 
-		for _, v := range valueList {
-			fmt.Fprintf(ofile, "%v %v\n", k, v)
+		for _, item := range kvList {
+			fmt.Fprintf(ofile, "%v %v\n", item.Key, item.Value)
 		}
 		ofile.Close()
 	}
@@ -107,8 +130,45 @@ func executeMapTask(
 	return intermediateFilesMapper
 }
 
-func executeReduceTask() {
+func executeReduceTask(
+	reduceTaskIndex int,
+	filenames []string,
+	reducef func(string, []string) string) string {
 
+	keyToValues := make(map[string][]string)
+
+	for _, filename := range filenames {
+		file, err := os.Open(filename)
+		if err != nil {
+			log.Fatalf("cannot open %v", filename)
+		}
+
+		scanner := bufio.NewScanner(file)
+		var key string
+		var value string
+
+		for scanner.Scan() {
+			line := scanner.Text()
+			fmt.Sscanf(line, "%s %s\n", &key, &value)
+			keyToValues[key] = append(keyToValues[key], value)
+		}
+
+		if err := scanner.Err(); err != nil {
+			log.Fatal(err)
+		}
+
+		file.Close()
+	}
+	filename := fmt.Sprintf("mr-out-%d", reduceTaskIndex)
+	ofile, _ := os.Create(filename)
+
+	for k, v := range keyToValues {
+		output := reducef(k, v)
+		fmt.Fprintf(ofile, "%v %v\n", k, output)
+	}
+	ofile.Close()
+
+	return filename
 }
 
 //
