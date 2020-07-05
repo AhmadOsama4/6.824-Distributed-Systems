@@ -84,9 +84,33 @@ func (rf *Raft) ResetTimeoutTimer() {
 	timeoutDuration := (MAX_TIMEOUT - MIN_TIMEOUT) / rf.numPeers
 	timeoutDuration = MIN_TIMEOUT + rangeRand*timeoutDuration
 
-	rf.mu.Lock()
 	rf.timeoutTime = time.Now().Add(time.Millisecond * time.Duration(timeoutDuration))
+}
+
+// Send hearbeat request to follower servers
+// should not execute these fn while holding the mu lock
+func (rf *Raft) sendHeartbeats() {
+	rf.mu.Lock()
+	currentTerm := rf.currentTerm
+	currentIndex := rf.me
 	rf.mu.Unlock()
+
+	for i, _ := range rf.peers {
+		if i == currentIndex {
+			continue
+		}
+
+		go func(server int) {
+			request := &AppendEntriesArgs{}
+			reply := &AppendEntriesReply{}
+
+			request.Term = currentTerm
+			request.LeaderId = currentIndex
+
+			rf.sendAppendEntries(server, request, reply)
+			DPrintf("HeartBeat Request from %d to %d => %t", currentIndex, server, reply.Success)
+		}(i)
+	}
 }
 
 func (rf *Raft) startElection() {
@@ -97,24 +121,22 @@ func (rf *Raft) startElection() {
 
 	curTerm := rf.currentTerm
 	curIndex := rf.me
+	rf.ResetTimeoutTimer()
 	rf.mu.Unlock()
 
-	rf.ResetTimeoutTimer()
-
 	log.Printf("Server %d is starting election curTerm: %d\n", curIndex, curTerm)
+
+	var voteMu sync.Mutex
+	cond := sync.NewCond(&voteMu)
 
 	receivedVotes := 1
 	receivedResponses := 0
 
+	// Start Elections
 	for i, _ := range rf.peers {
 		if i == curIndex {
 			continue
 		}
-		rf.mu.Lock()
-		if rf.currentState != CANDIDATE {
-			break
-		}
-		rf.mu.Unlock()
 
 		go func(peerIndex int) {
 			request := RequestVoteArgs{}
@@ -129,59 +151,58 @@ func (rf *Raft) startElection() {
 			rf.sendRequestVote(peerIndex, &request, &reply)
 			DPrintf("Vote req from %d to %d, term %d => %t\n", curIndex, peerIndex, curTerm, reply.VoteGranted)
 
-			rf.mu.Lock()
-			if rf.currentState == CANDIDATE && reply.Term == rf.currentTerm {
+			voteMu.Lock()
+			if reply.Term == curTerm {
 				receivedResponses++
 				if reply.VoteGranted {
 					receivedVotes++
 					DPrintf("Server %d received %d votes\n", curIndex, receivedVotes)
 				}
+			} else if reply.Term > curTerm {
+				rf.mu.Lock()
+				DPrintf("Server %d is now follower\n", rf.me)
+				rf.currentState = FOLLOWER
+				rf.currentTerm = reply.Term
+				rf.mu.Unlock()
+			} else {
+				DPrintf("Something wrong happened while voting")
 			}
 
-			// Obtained majority of votes
-			if rf.currentState == CANDIDATE && receivedVotes > rf.numPeers/2 {
-				log.Printf("Server %d won the elections for term: %d\n", curIndex, rf.currentTerm)
-				rf.currentState = LEADER
-
-				// Send append requests to announce leadership
-				for i, _ := range rf.peers {
-					if i == curIndex {
-						continue
-					}
-
-					go func(peerIndex int, currentTerm int) {
-						request := &AppendEntriesArgs{}
-						reply := &AppendEntriesReply{}
-						request.Term = currentTerm
-						rf.sendAppendEntries(peerIndex, request, reply)
-						DPrintf("Request from %d to %d => %t", curIndex, peerIndex, reply.Success)
-					}(i, curTerm)
-
-				}
-			}
-
-			rf.mu.Unlock()
-
+			cond.Broadcast()
+			voteMu.Unlock()
 		}(i)
-
-		rf.mu.Lock()
-		// no need to create new vote threads if majority obtained
-		if rf.currentState == LEADER {
-			rf.mu.Unlock()
-			break
-		}
-		rf.mu.Unlock()
-
 	}
 
-	// rf.mu.Lock()
-	// // if not heard back from the majority of peers, could be in split brain
-	// // decrement the term so that if it reconnects back to the network
-	// // it will not have a higher term than other peers
-	// if rf.currentState == CANDIDATE && receivedResponses < rf.numPeers/2 {
-	// 	rf.currentTerm--
-	// }
-	// rf.mu.Unlock()
+	currentState := CANDIDATE
+	majority := rf.numPeers / 2
+
+	// Wait
+	voteMu.Lock()
+
+	for currentState == CANDIDATE && receivedVotes <= majority && receivedResponses+1 < rf.numPeers {
+		rf.mu.Lock()
+		currentState = rf.currentState
+		DPrintf("Server %d state: %d receivedVotes %d receivedResponses %d\n", rf.me, rf.currentState, receivedVotes, receivedResponses)
+		rf.mu.Unlock()
+		cond.Wait()
+	}
+	DPrintf("Server %d state after election: %d", curIndex, currentState)
+
+	rf.mu.Lock()
+	//DPrintf("Server %d done with election in state %d\n", rf.me, rf.)
+	if receivedVotes > majority {
+		rf.currentState = LEADER
+		DPrintf("Server %d won the elections for term %d\n", rf.me, rf.currentTerm)
+		rf.mu.Unlock()
+		rf.sendHeartbeats()
+	} else {
+		if receivedResponses+1 != rf.numPeers {
+			rf.currentTerm--
+		}
+		rf.mu.Unlock()
+	}
+
+	voteMu.Unlock()
 }
 
 func (rf *Raft) CheckTimeout() {
@@ -205,25 +226,11 @@ func (rf *Raft) CheckTimeout() {
 func (rf *Raft) SendEmptyAppendIfLeader() {
 	for !rf.killed() {
 		rf.mu.Lock()
-		currentTerm := rf.currentTerm
-		currentIndex := rf.me
 		isLeader := rf.currentState == LEADER
 		rf.mu.Unlock()
 
 		if isLeader {
-			for i, _ := range rf.peers {
-				if i == currentIndex {
-					continue
-				}
-				go func(peerIndex int) {
-					request := &AppendEntriesArgs{}
-					reply := &AppendEntriesReply{}
-					request.Term = currentTerm
-					request.LeaderId = currentIndex
-
-					rf.sendAppendEntries(peerIndex, request, reply)
-				}(i)
-			}
+			rf.sendHeartbeats()
 		}
 
 		time.Sleep(time.Millisecond * 150)
@@ -247,12 +254,13 @@ type AppendEntriesReply struct {
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
 	currentTerm := rf.currentTerm
 	//rf.mu.Unlock()
 	if args.Term < currentTerm {
 		reply.Success = false
 		reply.Term = currentTerm
-		rf.mu.Unlock()
 		return
 	}
 
@@ -260,8 +268,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	log.Printf("Server %d confirms server %d is leader for term %d\n", rf.me, args.LeaderId, args.Term)
 	rf.currentState = FOLLOWER
 	rf.currentTerm = args.Term
-	rf.mu.Unlock()
-
 	rf.ResetTimeoutTimer()
 
 	reply.Success = true
@@ -364,6 +370,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.Term = rf.currentTerm
 
 		rf.votedFor = args.CandidateId
+		rf.ResetTimeoutTimer()
 	}
 
 	DPrintf("Server %d voted for %d currentTerm %d\n", rf.me, args.CandidateId, rf.currentTerm)
