@@ -49,9 +49,9 @@ type ApplyMsg struct {
 }
 
 const (
-	LEADER    = iota
-	FOLLOWER  = iota
-	CANDIDATE = iota
+	LEADER    = "LEADER"
+	FOLLOWER  = "FOLLOWER"
+	CANDIDATE = "CANDIDATE"
 )
 
 const MIN_TIMEOUT = 350
@@ -72,19 +72,24 @@ type Raft struct {
 	// state a Raft server must maintain.
 	//receivedVotes     int
 	//receivedResponses int
-	currentState int
+	currentState string
 	currentTerm  int
 	votedFor     int
 	numPeers     int       // number of peers in the cluster
 	timeoutTime  time.Time // time to start a new election if no leader
 }
 
+// To be executed when holding the lock
 func (rf *Raft) ResetTimeoutTimer() {
+	rand.Seed(time.Now().UnixNano())
 	rangeRand := rand.Intn(rf.numPeers)
 	timeoutDuration := (MAX_TIMEOUT - MIN_TIMEOUT) / rf.numPeers
 	timeoutDuration = MIN_TIMEOUT + rangeRand*timeoutDuration
+	//timeoutDuration := rand.Intn(MAX_TIMEOUT-MIN_TIMEOUT) + MIN_TIMEOUT
 
+	//rf.timeoutTime = time.Now().Add(time.Millisecond * time.Duration(timeoutDuration))
 	rf.timeoutTime = time.Now().Add(time.Millisecond * time.Duration(timeoutDuration))
+	DPrintf("[%d] Resetting timeout for Server %d, state: %s, to be after %d ms", rf.currentTerm, rf.me, rf.currentState, timeoutDuration)
 }
 
 // Send hearbeat request to follower servers
@@ -93,6 +98,8 @@ func (rf *Raft) sendHeartbeats() {
 	rf.mu.Lock()
 	currentTerm := rf.currentTerm
 	currentIndex := rf.me
+	currentState := rf.currentState
+	rf.ResetTimeoutTimer()
 	rf.mu.Unlock()
 
 	for i, _ := range rf.peers {
@@ -107,8 +114,16 @@ func (rf *Raft) sendHeartbeats() {
 			request.Term = currentTerm
 			request.LeaderId = currentIndex
 
-			rf.sendAppendEntries(server, request, reply)
-			DPrintf("HeartBeat Request from %d to %d => %t", currentIndex, server, reply.Success)
+			ok := rf.sendAppendEntries(server, request, reply)
+			DPrintf("[%d] HeartBeat Request from %d to %d, sender state: %s, success => %t, receiverTerm %d\n", currentTerm, currentIndex, server, currentState, ok, reply.Term)
+
+			rf.mu.Lock()
+			if ok && reply.Term > rf.currentTerm {
+				rf.currentState = FOLLOWER
+				DPrintf("Server %d returned back as follower\n", rf.me)
+			}
+			rf.mu.Unlock()
+
 		}(i)
 	}
 }
@@ -121,7 +136,6 @@ func (rf *Raft) startElection() {
 
 	curTerm := rf.currentTerm
 	curIndex := rf.me
-	rf.ResetTimeoutTimer()
 	rf.mu.Unlock()
 
 	log.Printf("Server %d is starting election curTerm: %d\n", curIndex, curTerm)
@@ -148,8 +162,8 @@ func (rf *Raft) startElection() {
 			request.LastLogTerm = -1
 
 			log.Printf("Sever %d sending vote request to %d for term %d\n", curIndex, peerIndex, curTerm)
-			rf.sendRequestVote(peerIndex, &request, &reply)
-			DPrintf("Vote req from %d to %d, term %d => %t\n", curIndex, peerIndex, curTerm, reply.VoteGranted)
+			ok := rf.sendRequestVote(peerIndex, &request, &reply)
+			DPrintf("Vote req from %d to %d, term %d => %t\n", curIndex, peerIndex, curTerm, ok)
 
 			voteMu.Lock()
 			if reply.Term == curTerm {
@@ -182,23 +196,26 @@ func (rf *Raft) startElection() {
 	for currentState == CANDIDATE && receivedVotes <= majority && receivedResponses+1 < rf.numPeers {
 		rf.mu.Lock()
 		currentState = rf.currentState
-		DPrintf("Server %d state: %d receivedVotes %d receivedResponses %d\n", rf.me, rf.currentState, receivedVotes, receivedResponses)
+		//DPrintf("Server %d state: %s receivedVotes %d receivedResponses %d\n", rf.me, rf.currentState, receivedVotes, receivedResponses)
 		rf.mu.Unlock()
 		cond.Wait()
 	}
-	DPrintf("Server %d state after election: %d", curIndex, currentState)
+	// DPrintf("Server %d state after election: %s\n", curIndex, currentState)
 
 	rf.mu.Lock()
+
+	if rf.currentState != CANDIDATE || rf.currentTerm != curTerm {
+		rf.mu.Unlock()
+		return
+	}
+
 	//DPrintf("Server %d done with election in state %d\n", rf.me, rf.)
 	if receivedVotes > majority {
 		rf.currentState = LEADER
 		DPrintf("Server %d won the elections for term %d\n", rf.me, rf.currentTerm)
 		rf.mu.Unlock()
-		rf.sendHeartbeats()
+		go rf.sendHeartbeats()
 	} else {
-		if receivedResponses+1 != rf.numPeers {
-			rf.currentTerm--
-		}
 		rf.mu.Unlock()
 	}
 
@@ -210,14 +227,17 @@ func (rf *Raft) CheckTimeout() {
 		rf.mu.Lock()
 		timeoutVal := rf.timeoutTime
 		curState := rf.currentState
-		rf.mu.Unlock()
+		curTerm := rf.currentTerm
 
 		if time.Now().Sub(timeoutVal) <= 0 { // Start new election
-			fmt.Println("Cur State", curState, "Time now", time.Now(), "timeout time", timeoutVal)
+			fmt.Println("[", curTerm, "]", "Cur State", curState, "Time now", time.Now(), "timeout time", timeoutVal)
+			rf.ResetTimeoutTimer()
 			if curState != LEADER {
-				rf.startElection()
+				go rf.startElection()
 			}
 		}
+		rf.mu.Unlock()
+
 		time.Sleep(time.Millisecond * 300)
 	}
 }
@@ -256,11 +276,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	currentTerm := rf.currentTerm
 	//rf.mu.Unlock()
-	if args.Term < currentTerm {
+	if args.Term < rf.currentTerm {
 		reply.Success = false
-		reply.Term = currentTerm
+		reply.Term = rf.currentTerm
 		return
 	}
 
@@ -368,6 +387,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = true
 		rf.currentTerm = args.Term
 		reply.Term = rf.currentTerm
+		rf.currentState = FOLLOWER
 
 		rf.votedFor = args.CandidateId
 		rf.ResetTimeoutTimer()
