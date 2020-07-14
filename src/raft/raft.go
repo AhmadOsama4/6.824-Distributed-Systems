@@ -112,13 +112,14 @@ func (rf *Raft) UpdateLastHeartBeat() {
 // To be executed while holding the lock
 func (rf *Raft) getNextLogIndex() int {
 	if len(rf.Logs) == 0 {
-		return 0
+		return 1
 	} else {
 		return rf.Logs[len(rf.Logs)-1].LogIndex + 1
 	}
 }
 
 // To be executed while holding the lock
+// Return index, entry of the last log
 func (rf *Raft) getlastLogInfo() (int, int) {
 	if len(rf.Logs) == 0 {
 		return -1, -1
@@ -131,10 +132,11 @@ func (rf *Raft) getlastLogInfo() (int, int) {
 
 // To be executed while holding the lock
 func (rf *Raft) getEntryAt(index int) LogEntry {
-	if index >= len(rf.Logs) {
+	if index <= 0 || index > len(rf.Logs) {
 		return LogEntry{}
 	}
-	return rf.Logs[index]
+	i := index - rf.Logs[0].LogIndex
+	return rf.Logs[i]
 }
 
 // Send hearbeat request to follower servers
@@ -205,8 +207,8 @@ func (rf *Raft) startElection() {
 
 			request.Term = curTerm
 			request.CandidateId = curIndex
-			request.LastLogIndex = -1
-			request.LastLogTerm = -1
+			request.LastLogIndex = 0
+			request.LastLogTerm = 0
 
 			log.Printf("Sever %d sending vote request to %d for term %d\n", curIndex, peerIndex, curTerm)
 			ok := rf.sendRequestVote(peerIndex, &request, &reply)
@@ -278,7 +280,7 @@ func (rf *Raft) becomeLeader() {
 		}
 
 		rf.nextIndex[server] = initNextIndex
-		rf.matchIndex[server] = -1
+		rf.matchIndex[server] = 0
 	}
 
 	go rf.sendHeartbeats()
@@ -359,7 +361,7 @@ func (rf *Raft) SendConfirmationsThread() {
 				DPrintf("(%d) vs (%d) server %d\n", i, len(rf.Logs), rf.me)
 				apply := ApplyMsg{}
 				apply.CommandValid = true
-				apply.CommandIndex = i + 1
+				apply.CommandIndex = i
 				apply.Command = rf.getEntryAt(i).Command
 
 				rf.applyCh <- apply
@@ -384,8 +386,10 @@ func (rf *Raft) UpdateLastCommitIndex() {
 				return
 			}
 
-			for i := rf.commitIndex + 1; ; i++ {
-				replicatedCount := 0
+			lastIndex, _ := rf.getlastLogInfo()
+
+			for i := rf.commitIndex + 1; i <= lastIndex; i++ {
+				replicatedCount := 1
 
 				for server, _ := range rf.peers {
 					if rf.matchIndex[server] >= i {
@@ -587,21 +591,20 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	defer rf.mu.Unlock()
 	// either voted for self or got the term of another leader
 	DPrintf("Server %d received vote req from %d for term %d currentTerm: %d", rf.me, args.CandidateId, args.Term, rf.currentTerm)
-	if args.Term <= rf.currentTerm {
-		reply.VoteGranted = false
-		reply.Term = rf.currentTerm
+	reply.VoteGranted = false
+	reply.Term = rf.currentTerm
+	if args.Term < rf.currentTerm {
 		return
-	} else {
-		// TODO: perferm logs check
-
-		reply.VoteGranted = true
-		rf.currentTerm = args.Term
-		reply.Term = rf.currentTerm
-		rf.currentState = FOLLOWER
-
-		rf.votedFor = args.CandidateId
-		rf.UpdateLastHeartBeat()
 	}
+	// TODO: perferm logs check
+
+	reply.VoteGranted = true
+	rf.currentTerm = args.Term
+	reply.Term = rf.currentTerm
+	rf.currentState = FOLLOWER
+
+	rf.votedFor = args.CandidateId
+	rf.UpdateLastHeartBeat()
 
 	DPrintf("Server %d voted for %d currentTerm %d\n", rf.me, args.CandidateId, rf.currentTerm)
 }
@@ -679,7 +682,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.ReplicateLogs(index, command)
 	}
 
-	return index + 1, term, isLeader
+	return index, term, isLeader
 }
 
 //
@@ -726,8 +729,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.numPeers = len(peers)
 	rf.currentState = FOLLOWER
 	rf.votedFor = -1
-	rf.lastAppliedIndex = -1
-	rf.commitIndex = -1
+	rf.lastAppliedIndex = 0
+	rf.commitIndex = 0
 
 	rf.nextIndex = make(map[int]int)
 	rf.matchIndex = make(map[int]int)
