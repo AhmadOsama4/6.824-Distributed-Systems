@@ -119,13 +119,24 @@ func (rf *Raft) getNextLogIndex() int {
 }
 
 // To be executed while holding the lock
-// Return index, entry of the last log
+// Return index, term of the last log
 func (rf *Raft) getlastLogInfo() (int, int) {
 	if len(rf.Logs) == 0 {
 		return -1, -1
 	} else {
 		entry := &rf.Logs[len(rf.Logs)-1]
 
+		return entry.LogIndex, entry.LogTerm
+	}
+}
+
+// To be executed while holding the lock
+// Return index, term of the log at index
+func (rf *Raft) getInfoAt(index int) (int, int) {
+	if index <= 0 || index > len(rf.Logs) {
+		return -1, -1
+	} else {
+		entry := rf.getEntryAt(index)
 		return entry.LogIndex, entry.LogTerm
 	}
 }
@@ -185,6 +196,7 @@ func (rf *Raft) startElection() {
 
 	curTerm := rf.currentTerm
 	curIndex := rf.me
+	lastLogIndex, lastLogTerm := rf.getlastLogInfo()
 	rf.mu.Unlock()
 
 	log.Printf("Server %d is starting election curTerm: %d\n", curIndex, curTerm)
@@ -207,8 +219,8 @@ func (rf *Raft) startElection() {
 
 			request.Term = curTerm
 			request.CandidateId = curIndex
-			request.LastLogIndex = 0
-			request.LastLogTerm = 0
+			request.LastLogIndex = lastLogIndex
+			request.LastLogTerm = lastLogTerm
 
 			log.Printf("Sever %d sending vote request to %d for term %d\n", curIndex, peerIndex, curTerm)
 			ok := rf.sendRequestVote(peerIndex, &request, &reply)
@@ -291,6 +303,13 @@ func (rf *Raft) handleServerAppendLogs(server int, request AppendEntriesArgs) {
 	reply := &AppendEntriesReply{}
 	DPrintf("[%d] Sending Append Request to server %d\n", request.Term, server)
 	DPrintf("Request Details => Length: %d\n", len(request.Entries))
+
+	// rf.mu.Lock()
+	// nextIndex := rf.nextIndex[server]
+	// request.PrevLogIndex, request.PrevLogTerm = rf.getInfoAt(nextIndex - 1)
+	// request.Entries = rf.Logs[nextIndex:]
+	// rf.mu.Unlock()
+
 	ok := rf.sendAppendEntries(server, &request, reply)
 
 	if !ok {
@@ -597,16 +616,19 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 	// TODO: perferm logs check
+	lastLogIndex, lastLogTerm := rf.getlastLogInfo()
+	DPrintf("Vote req: lastindex - %d, lastterm %d VS me: index - %d, lastTerm %d\n", args.LastLogIndex, args.LastLogTerm, lastLogIndex, lastLogTerm)
+	if args.LastLogTerm > lastLogTerm || (args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex) {
+		reply.VoteGranted = true
+		rf.currentTerm = args.Term
+		reply.Term = rf.currentTerm
+		rf.currentState = FOLLOWER
 
-	reply.VoteGranted = true
-	rf.currentTerm = args.Term
-	reply.Term = rf.currentTerm
-	rf.currentState = FOLLOWER
+		rf.votedFor = args.CandidateId
+		rf.UpdateLastHeartBeat()
+		DPrintf("Server %d voted for %d currentTerm %d\n", rf.me, args.CandidateId, rf.currentTerm)
+	}
 
-	rf.votedFor = args.CandidateId
-	rf.UpdateLastHeartBeat()
-
-	DPrintf("Server %d voted for %d currentTerm %d\n", rf.me, args.CandidateId, rf.currentTerm)
 }
 
 //
@@ -670,8 +692,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-
-	isLeader = rf.currentState == LEADER
 
 	isLeader = rf.currentState == LEADER
 
