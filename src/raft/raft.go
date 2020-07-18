@@ -150,6 +150,15 @@ func (rf *Raft) getEntryAt(index int) LogEntry {
 	return rf.Logs[i]
 }
 
+// To be executed while holding the lock
+func (rf *Raft) getEntriesFrom(index int) []LogEntry {
+	if index <= 0 || index > len(rf.Logs) {
+		return []LogEntry{}
+	}
+	i := index - rf.Logs[0].LogIndex
+	return rf.Logs[i:]
+}
+
 // Send hearbeat request to follower servers
 // should not execute these fn while holding the mu lock
 func (rf *Raft) sendHeartbeats() {
@@ -299,16 +308,16 @@ func (rf *Raft) becomeLeader() {
 	DPrintf("Server %d won the elections for term %d\n", rf.me, rf.currentTerm)
 }
 
-func (rf *Raft) handleServerAppendLogs(server int, request AppendEntriesArgs) {
+func (rf *Raft) handleServerAppendLogs(server int, lastIndex int, request AppendEntriesArgs) {
 	reply := &AppendEntriesReply{}
 	DPrintf("[%d] Sending Append Request to server %d\n", request.Term, server)
 	DPrintf("Request Details => Length: %d\n", len(request.Entries))
 
-	// rf.mu.Lock()
-	// nextIndex := rf.nextIndex[server]
-	// request.PrevLogIndex, request.PrevLogTerm = rf.getInfoAt(nextIndex - 1)
-	// request.Entries = rf.Logs[nextIndex:]
-	// rf.mu.Unlock()
+	rf.mu.Lock()
+	nextIndex := rf.nextIndex[server]
+	request.PrevLogIndex, request.PrevLogTerm = rf.getInfoAt(nextIndex - 1)
+	request.Entries = rf.getEntriesFrom(nextIndex)
+	rf.mu.Unlock()
 
 	ok := rf.sendAppendEntries(server, &request, reply)
 
@@ -318,17 +327,31 @@ func (rf *Raft) handleServerAppendLogs(server int, request AppendEntriesArgs) {
 
 	rf.mu.Lock()
 
-	nextIndex := rf.nextIndex[server]
+	//nextIndex = rf.nextIndex[server]
 
 	if reply.Term > rf.currentTerm {
 		rf.currentState = FOLLOWER
+		rf.mu.Unlock()
+		return
 	} else if reply.Success {
-		rf.matchIndex[server] = nextIndex
-		rf.nextIndex[server]++
-	} else {
-		DPrintf("ToDo\n")
+		rf.matchIndex[server] = lastIndex
+		rf.nextIndex[server] = lastIndex + 1
 	}
 	rf.mu.Unlock()
+
+	// for ok && !reply.Success {
+	// 	rf.mu.Lock()
+
+	// 	rf.mu.Unlock()
+	// }
+
+	// if reply.Success {
+	// 	rf.mu.Lock()
+	// 	rf.nextIndex[server] = lastIndex + 1
+	// 	rf.matchIndex[server] = lastIndex
+	// 	rf.mu.Unlock()
+	// }
+
 }
 
 // Replicated Logs on leader and followers
@@ -351,6 +374,8 @@ func (rf *Raft) ReplicateLogs(index int, command interface{}) {
 	request.Entries = []LogEntry{entry}
 
 	rf.Logs = append(rf.Logs, entry)
+
+	lastIndex, _ := rf.getlastLogInfo()
 	DPrintf("Log size for server %d : %d\n", rf.me, len(rf.Logs))
 
 	//rf.mu.Unlock()
@@ -360,7 +385,7 @@ func (rf *Raft) ReplicateLogs(index int, command interface{}) {
 			continue
 		}
 
-		go rf.handleServerAppendLogs(server, request)
+		go rf.handleServerAppendLogs(server, lastIndex, request)
 	}
 
 }
@@ -615,7 +640,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term < rf.currentTerm {
 		return
 	}
-	// TODO: perferm logs check
 	lastLogIndex, lastLogTerm := rf.getlastLogInfo()
 	DPrintf("Vote req: lastindex - %d, lastterm %d VS me: index - %d, lastTerm %d\n", args.LastLogIndex, args.LastLogTerm, lastLogIndex, lastLogTerm)
 	if args.LastLogTerm > lastLogTerm || (args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex) {
