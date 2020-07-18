@@ -136,26 +136,32 @@ func (rf *Raft) getInfoAt(index int) (int, int) {
 	if index <= 0 || index > len(rf.Logs) {
 		return -1, -1
 	} else {
-		entry := rf.getEntryAt(index)
+		_, entry := rf.getEntryAt(index)
 		return entry.LogIndex, entry.LogTerm
 	}
 }
 
 // To be executed while holding the lock
-func (rf *Raft) getEntryAt(index int) LogEntry {
+func (rf *Raft) getEntryAt(index int) (bool, LogEntry) {
 	if index <= 0 || index > len(rf.Logs) {
-		return LogEntry{}
+		return false, LogEntry{}
 	}
 	i := index - rf.Logs[0].LogIndex
-	return rf.Logs[i]
+	return true, rf.Logs[i]
 }
 
 // To be executed while holding the lock
-func (rf *Raft) getEntriesFrom(index int) []LogEntry {
-	if index <= 0 || index > len(rf.Logs) {
+func (rf *Raft) getEntriesFromTo(fromIndex int, toIndex int) []LogEntry {
+	if fromIndex <= 0 || fromIndex > len(rf.Logs) {
 		return []LogEntry{}
 	}
-	i := index - rf.Logs[0].LogIndex
+
+	i := fromIndex - rf.Logs[0].LogIndex
+	j := i + (toIndex - fromIndex) + 1
+	if j >= len(rf.Logs) {
+		j = len(rf.Logs)
+	}
+
 	return rf.Logs[i:]
 }
 
@@ -236,20 +242,23 @@ func (rf *Raft) startElection() {
 			DPrintf("Vote req from %d to %d, term %d => %t\n", curIndex, peerIndex, curTerm, ok)
 
 			voteMu.Lock()
-			if reply.Term == curTerm {
-				receivedResponses++
-				if reply.VoteGranted {
-					receivedVotes++
-					DPrintf("Server %d received %d votes\n", curIndex, receivedVotes)
+			receivedResponses++
+			if ok {
+				if reply.Term == curTerm {
+					if reply.VoteGranted {
+						receivedVotes++
+						DPrintf("Server %d received %d votes\n", curIndex, receivedVotes)
+					}
+				} else if reply.Term > curTerm {
+					rf.mu.Lock()
+					DPrintf("Server %d is now follower\n", rf.me)
+					rf.currentState = FOLLOWER
+					rf.currentTerm = reply.Term
+					rf.mu.Unlock()
+				} else {
+					DPrintf("Something wrong happened while voting")
 				}
-			} else if reply.Term > curTerm {
-				rf.mu.Lock()
-				DPrintf("Server %d is now follower\n", rf.me)
-				rf.currentState = FOLLOWER
-				rf.currentTerm = reply.Term
-				rf.mu.Unlock()
-			} else {
-				DPrintf("Something wrong happened while voting")
+
 			}
 
 			cond.Broadcast()
@@ -279,11 +288,12 @@ func (rf *Raft) startElection() {
 		return
 	}
 
-	//DPrintf("Server %d done with election in state %d\n", rf.me, rf.)
+	DPrintf("Server %d done with election in state %v\n", rf.me, rf.currentState)
 	if receivedVotes > majority {
 		rf.becomeLeader()
 		rf.mu.Unlock()
 	} else {
+		DPrintf("[%d] Server %d has not received majority\n", rf.currentTerm, rf.me)
 		rf.mu.Unlock()
 	}
 
@@ -316,7 +326,7 @@ func (rf *Raft) handleServerAppendLogs(server int, lastIndex int, request Append
 	rf.mu.Lock()
 	nextIndex := rf.nextIndex[server]
 	request.PrevLogIndex, request.PrevLogTerm = rf.getInfoAt(nextIndex - 1)
-	request.Entries = rf.getEntriesFrom(nextIndex)
+	request.Entries = rf.getEntriesFromTo(nextIndex, lastIndex)
 	rf.mu.Unlock()
 
 	ok := rf.sendAppendEntries(server, &request, reply)
@@ -333,24 +343,26 @@ func (rf *Raft) handleServerAppendLogs(server int, lastIndex int, request Append
 		rf.currentState = FOLLOWER
 		rf.mu.Unlock()
 		return
-	} else if reply.Success {
-		rf.matchIndex[server] = lastIndex
-		rf.nextIndex[server] = lastIndex + 1
 	}
 	rf.mu.Unlock()
 
-	// for ok && !reply.Success {
-	// 	rf.mu.Lock()
+	for ok && !reply.Success {
+		rf.mu.Lock()
+		rf.nextIndex[server]--
+		nextIndex := rf.nextIndex[server]
+		request.PrevLogIndex, request.PrevLogTerm = rf.getInfoAt(nextIndex - 1)
+		request.Entries = rf.getEntriesFromTo(nextIndex, lastIndex)
+		rf.mu.Unlock()
 
-	// 	rf.mu.Unlock()
-	// }
+		ok = rf.sendAppendEntries(server, &request, reply)
+	}
 
-	// if reply.Success {
-	// 	rf.mu.Lock()
-	// 	rf.nextIndex[server] = lastIndex + 1
-	// 	rf.matchIndex[server] = lastIndex
-	// 	rf.mu.Unlock()
-	// }
+	if reply.Success {
+		rf.mu.Lock()
+		rf.nextIndex[server] = lastIndex + 1
+		rf.matchIndex[server] = lastIndex
+		rf.mu.Unlock()
+	}
 
 }
 
@@ -406,7 +418,8 @@ func (rf *Raft) SendConfirmationsThread() {
 				apply := ApplyMsg{}
 				apply.CommandValid = true
 				apply.CommandIndex = i
-				apply.Command = rf.getEntryAt(i).Command
+				_, entry := rf.getEntryAt(i)
+				apply.Command = entry.Command
 
 				rf.applyCh <- apply
 				DPrintf("Server %d sending confirmation to Service, index: %d command %v\n", rf.me, i, apply.Command)
@@ -526,7 +539,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Term = args.Term
 	reply.Success = true
 
-	lastIndex, lastTerm := rf.getlastLogInfo()
+	lastIndex, _ := rf.getlastLogInfo()
 
 	// Update latest committed index
 	rf.commitIndex = args.LeaderCommit
@@ -540,10 +553,18 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	DPrintf("Appending Logs for server %d -----------------------------------\n", rf.me)
+	found, entry := rf.getEntryAt(args.PrevLogIndex)
 
-	if lastIndex == -1 || (lastIndex == args.PrevLogIndex && lastTerm == args.PrevLogTerm) {
-		rf.Logs = append(rf.Logs, args.Entries...)
+	//DPrintf("Appending Logs for server %d -----------------------------------\n", rf.me)
+
+	if lastIndex == -1 || (found && entry.LogIndex <= args.PrevLogIndex && entry.LogTerm == args.PrevLogTerm) {
+		// empty logs
+		if lastIndex == -1 {
+			rf.Logs = append(rf.Logs, args.Entries...)
+		} else {
+			i := entry.LogIndex - rf.Logs[0].LogIndex + 1
+			rf.Logs = append(rf.Logs[:i], args.Entries...)
+		}
 		DPrintf("[%d] Appending Done for server %d index %d\n", rf.currentTerm, rf.me, lastIndex)
 	} else {
 		reply.Success = false
@@ -720,7 +741,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader = rf.currentState == LEADER
 
 	if isLeader {
-		DPrintf("Server %d Received Start Req\n", rf.me)
+		DPrintf("Server %d Received Start Req Command %v\n", rf.me, command)
 		index = rf.getNextLogIndex()
 		term = rf.currentTerm
 		rf.ReplicateLogs(index, command)
