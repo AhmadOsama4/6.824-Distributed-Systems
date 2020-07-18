@@ -171,8 +171,9 @@ func (rf *Raft) sendHeartbeats() {
 	rf.mu.Lock()
 	currentTerm := rf.currentTerm
 	currentIndex := rf.me
-	currentState := rf.currentState
+	//currentState := rf.currentState
 	currentCommit := rf.commitIndex
+	lastIndex, lastTerm := rf.getlastLogInfo()
 	rf.UpdateLastHeartBeat()
 	rf.mu.Unlock()
 
@@ -182,20 +183,33 @@ func (rf *Raft) sendHeartbeats() {
 		}
 
 		go func(server int) {
-			request := &AppendEntriesArgs{}
-			reply := &AppendEntriesReply{}
+			request := AppendEntriesArgs{}
+			reply := AppendEntriesReply{}
 
 			request.Term = currentTerm
 			request.LeaderId = currentIndex
 			request.LeaderCommit = currentCommit
+			request.PrevLogIndex = lastIndex
+			request.PrevLogTerm = lastTerm
 
-			ok := rf.sendAppendEntries(server, request, reply)
-			DPrintf("[%d] HeartBeat Request from %d to %d, sender state: %s, success => %t, receiverTerm %d\n", currentTerm, currentIndex, server, currentState, ok, reply.Term)
+			ok := rf.sendAppendEntries(server, &request, &reply)
+			//DPrintf("[%d] HeartBeat Request from %d to %d, sender state: %s, success => %t, receiverTerm %d\n", currentTerm, currentIndex, server, currentState, ok, reply.Term)
 
 			rf.mu.Lock()
 			if ok && reply.Term > rf.currentTerm {
 				rf.currentState = FOLLOWER
 				DPrintf("Server %d returned back as follower\n", rf.me)
+				rf.mu.Unlock()
+				return
+			}
+
+			// follower out of sync
+			if ok && !reply.Success {
+				request.LeaderCommit = rf.commitIndex
+				request.LeaderId = rf.me
+				request.Term = rf.currentTerm
+
+				go rf.handleServerAppendLogs(server, lastIndex, request)
 			}
 			rf.mu.Unlock()
 
@@ -239,7 +253,7 @@ func (rf *Raft) startElection() {
 
 			log.Printf("Sever %d sending vote request to %d for term %d\n", curIndex, peerIndex, curTerm)
 			ok := rf.sendRequestVote(peerIndex, &request, &reply)
-			DPrintf("Vote req from %d to %d, term %d => %t\n", curIndex, peerIndex, curTerm, ok)
+			//DPrintf("Vote req from %d to %d, term %d => %t\n", curIndex, peerIndex, curTerm, ok)
 
 			voteMu.Lock()
 			receivedResponses++
@@ -382,13 +396,13 @@ func (rf *Raft) ReplicateLogs(index int, command interface{}) {
 	request.LeaderCommit = rf.commitIndex
 	request.LeaderId = rf.me
 	request.Term = rf.currentTerm
-	request.PrevLogIndex, request.PrevLogTerm = rf.getlastLogInfo()
-	request.Entries = []LogEntry{entry}
+	// request.PrevLogIndex, request.PrevLogTerm = rf.getlastLogInfo()
+	// request.Entries = []LogEntry{entry}
 
 	rf.Logs = append(rf.Logs, entry)
 
 	lastIndex, _ := rf.getlastLogInfo()
-	DPrintf("Log size for server %d : %d\n", rf.me, len(rf.Logs))
+	DPrintf("Log size for server%d = %d\n", rf.me, len(rf.Logs))
 
 	//rf.mu.Unlock()
 
@@ -536,29 +550,32 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.currentState = FOLLOWER
 	rf.currentTerm = args.Term
 	rf.UpdateLastHeartBeat()
-	reply.Term = args.Term
+	reply.Term = rf.currentTerm
 	reply.Success = true
 
 	lastIndex, _ := rf.getlastLogInfo()
 
-	// Update latest committed index
-	rf.commitIndex = args.LeaderCommit
-	if args.LeaderCommit > lastIndex {
-		rf.commitIndex = lastIndex
-	}
-
 	// regular heartbeat message
-	if len(args.Entries) == 0 {
-		DPrintf("Regular Hearbeat message ..............................\n")
-		return
-	}
+	// if len(args.Entries) == 0 {
+	// 	DPrintf("Regular Hearbeat message ..............................\n")
+	// 	return
+	// }
 
 	found, entry := rf.getEntryAt(args.PrevLogIndex)
 
 	//DPrintf("Appending Logs for server %d -----------------------------------\n", rf.me)
 
 	if lastIndex == -1 || (found && entry.LogIndex <= args.PrevLogIndex && entry.LogTerm == args.PrevLogTerm) {
-		// empty logs
+		// Update latest committed index
+		rf.commitIndex = args.LeaderCommit
+		if args.LeaderCommit > lastIndex {
+			rf.commitIndex = lastIndex
+		}
+		// Regular Hearbeat message
+		if len(args.Entries) == 0 {
+			return
+		}
+		// server has no logs yet
 		if lastIndex == -1 {
 			rf.Logs = append(rf.Logs, args.Entries...)
 		} else {
