@@ -152,17 +152,92 @@ func (rf *Raft) getEntryAt(index int) (bool, LogEntry) {
 
 // To be executed while holding the lock
 func (rf *Raft) getEntriesFromTo(fromIndex int, toIndex int) []LogEntry {
-	if fromIndex <= 0 || fromIndex > len(rf.Logs) {
+	if toIndex < fromIndex {
+		DPrintf("[ERROR] toIndex less than fromIndex\n")
 		return []LogEntry{}
+	}
+	if fromIndex > len(rf.Logs) {
+		DPrintf("[ERROR] fromIndex is larger than logLength\n")
+		return []LogEntry{}
+	}
+	if fromIndex <= 0 {
+		fromIndex = 1
 	}
 
 	i := fromIndex - rf.Logs[0].LogIndex
 	j := i + (toIndex - fromIndex) + 1
-	if j >= len(rf.Logs) {
+	if j > len(rf.Logs) {
 		j = len(rf.Logs)
 	}
 
+	return rf.Logs[i:j]
+}
+
+// To be executed while holding the lock
+func (rf *Raft) getEntriesFrom(fromIndex int) []LogEntry {
+	if fromIndex <= 0 || fromIndex > len(rf.Logs) {
+		return []LogEntry{}
+	}
+	i := fromIndex - rf.Logs[0].LogIndex
+
 	return rf.Logs[i:]
+}
+
+// To be executed while holding the lock
+// Returns the lower bound log based on term value
+func (rf *Raft) getLowerBoundEntry(term int) (bool, LogEntry) {
+	retBool := false
+	retEntry := LogEntry{}
+
+	L := 0
+	R := len(rf.Logs) - 1
+	index := -1
+
+	for L <= R {
+		var mid int = (L + R) / 2
+		if rf.Logs[mid].LogTerm >= term {
+			index = mid
+			R = mid - 1
+		} else {
+			L = mid + 1
+		}
+	}
+
+	if index != -1 {
+		retBool = true
+		retEntry = rf.Logs[index]
+	}
+
+	return retBool, retEntry
+}
+
+func (rf *Raft) findTermHighestIndex(term int) (bool, LogEntry) {
+	retBool := false
+	retEntry := LogEntry{}
+
+	L := 0
+	R := len(rf.Logs) - 1
+	index := -1
+
+	for L <= R {
+		var mid int = (L + R) / 2
+		termVal := rf.Logs[mid].LogTerm
+		if termVal <= term {
+			L = mid + 1
+			if termVal == term {
+				index = mid
+			}
+		} else {
+			R = mid - 1
+		}
+	}
+
+	if index != -1 {
+		retBool = true
+		retEntry = rf.Logs[index]
+	}
+
+	return retBool, retEntry
 }
 
 // Send hearbeat request to follower servers
@@ -209,7 +284,7 @@ func (rf *Raft) sendHeartbeats() {
 				request.LeaderId = rf.me
 				request.Term = rf.currentTerm
 
-				go rf.handleServerAppendLogs(server, lastIndex, request)
+				go rf.handleServerAppendLogs(server)
 			}
 			rf.mu.Unlock()
 
@@ -332,18 +407,25 @@ func (rf *Raft) becomeLeader() {
 	DPrintf("Server %d won the elections for term %d\n", rf.me, rf.currentTerm)
 }
 
-func (rf *Raft) handleServerAppendLogs(server int, lastIndex int, request AppendEntriesArgs) {
+func (rf *Raft) handleServerAppendLogs(server int) {
+	request := &AppendEntriesArgs{}
 	reply := &AppendEntriesReply{}
+
+	rf.mu.Lock()
+	request.LeaderCommit = rf.commitIndex
+	request.LeaderId = rf.me
+	request.Term = rf.currentTerm
+	nextIndex := rf.nextIndex[server]
+	request.PrevLogIndex, request.PrevLogTerm = rf.getInfoAt(nextIndex - 1)
+
+	lastIndex, _ := rf.getlastLogInfo()
+
+	request.Entries = rf.getEntriesFromTo(nextIndex, lastIndex)
+	rf.mu.Unlock()
 	DPrintf("[%d] Sending Append Request to server %d\n", request.Term, server)
 	DPrintf("Request Details => Length: %d\n", len(request.Entries))
 
-	rf.mu.Lock()
-	nextIndex := rf.nextIndex[server]
-	request.PrevLogIndex, request.PrevLogTerm = rf.getInfoAt(nextIndex - 1)
-	request.Entries = rf.getEntriesFromTo(nextIndex, lastIndex)
-	rf.mu.Unlock()
-
-	ok := rf.sendAppendEntries(server, &request, reply)
+	ok := rf.sendAppendEntries(server, request, reply)
 
 	if !ok {
 		return
@@ -351,33 +433,35 @@ func (rf *Raft) handleServerAppendLogs(server int, lastIndex int, request Append
 
 	rf.mu.Lock()
 
-	//nextIndex = rf.nextIndex[server]
-
 	if reply.Term > rf.currentTerm {
 		rf.currentState = FOLLOWER
 		rf.mu.Unlock()
 		return
 	}
-	rf.mu.Unlock()
-
-	for ok && !reply.Success {
-		rf.mu.Lock()
-		rf.nextIndex[server]--
-		nextIndex := rf.nextIndex[server]
-		request.PrevLogIndex, request.PrevLogTerm = rf.getInfoAt(nextIndex - 1)
-		request.Entries = rf.getEntriesFromTo(nextIndex, lastIndex)
-		rf.mu.Unlock()
-
-		ok = rf.sendAppendEntries(server, &request, reply)
-	}
 
 	if reply.Success {
-		rf.mu.Lock()
-		rf.nextIndex[server] = lastIndex + 1
-		rf.matchIndex[server] = lastIndex
-		rf.mu.Unlock()
+		if lastIndex > rf.matchIndex[server] {
+			rf.nextIndex[server] = lastIndex + 1
+			rf.matchIndex[server] = lastIndex
+		}
+	} else {
+		if reply.XTerm == -1 {
+			rf.nextIndex[server] = reply.XLen + 1
+		} else {
+			found, entry := rf.findTermHighestIndex(reply.XTerm)
+			if found {
+				rf.nextIndex[server] = entry.LogIndex + 1
+			} else {
+				rf.nextIndex[server] = reply.XIndex
+			}
+		}
 	}
 
+	rf.mu.Unlock()
+
+	if !reply.Success {
+		rf.handleServerAppendLogs(server)
+	}
 }
 
 // Replicated Logs on leader and followers
@@ -391,18 +475,18 @@ func (rf *Raft) ReplicateLogs(index int, command interface{}) {
 	entry.LogIndex = index
 	entry.LogTerm = rf.currentTerm
 
-	request := AppendEntriesArgs{}
+	// request := AppendEntriesArgs{}
 
-	request.LeaderCommit = rf.commitIndex
-	request.LeaderId = rf.me
-	request.Term = rf.currentTerm
+	// request.LeaderCommit = rf.commitIndex
+	// request.LeaderId = rf.me
+	// request.Term = rf.currentTerm
 	// request.PrevLogIndex, request.PrevLogTerm = rf.getlastLogInfo()
 	// request.Entries = []LogEntry{entry}
 
 	rf.Logs = append(rf.Logs, entry)
 
-	lastIndex, _ := rf.getlastLogInfo()
-	DPrintf("Log size for server%d = %d\n", rf.me, len(rf.Logs))
+	//lastIndex, _ := rf.getlastLogInfo()
+	DPrintf("Log size for leader server %d = %d\n", rf.me, len(rf.Logs))
 
 	//rf.mu.Unlock()
 
@@ -411,7 +495,7 @@ func (rf *Raft) ReplicateLogs(index int, command interface{}) {
 			continue
 		}
 
-		go rf.handleServerAppendLogs(server, lastIndex, request)
+		go rf.handleServerAppendLogs(server)
 	}
 
 }
@@ -533,6 +617,9 @@ type AppendEntriesArgs struct {
 
 type AppendEntriesReply struct {
 	Term    int
+	XTerm   int
+	XIndex  int
+	XLen    int
 	Success bool
 }
 
@@ -546,26 +633,24 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	log.Printf("Server %d confirms server %d is leader for term %d\n", rf.me, args.LeaderId, args.Term)
 	rf.currentState = FOLLOWER
 	rf.currentTerm = args.Term
-	rf.UpdateLastHeartBeat()
 	reply.Term = rf.currentTerm
-	reply.Success = true
+	reply.Success = false
 
-	lastIndex, _ := rf.getlastLogInfo()
-
-	// regular heartbeat message
-	// if len(args.Entries) == 0 {
-	// 	DPrintf("Regular Hearbeat message ..............................\n")
-	// 	return
-	// }
-
+	//lastIndex, _ := rf.getlastLogInfo()
+	lastIndex, lastTerm := rf.getlastLogInfo()
 	found, entry := rf.getEntryAt(args.PrevLogIndex)
+	rf.UpdateLastHeartBeat()
 
 	//DPrintf("Appending Logs for server %d -----------------------------------\n", rf.me)
+	var acceptAppend bool = (lastIndex == -1) ||
+		args.PrevLogIndex <= 0 ||
+		(found && entry.LogIndex == args.PrevLogIndex && entry.LogTerm == args.PrevLogTerm)
 
-	if lastIndex == -1 || (found && entry.LogIndex <= args.PrevLogIndex && entry.LogTerm == args.PrevLogTerm) {
+	if acceptAppend {
+		log.Printf("Server %d confirms server %d is leader for term %d\n", rf.me, args.LeaderId, args.Term)
+		reply.Success = true
 		// Update latest committed index
 		rf.commitIndex = args.LeaderCommit
 		if args.LeaderCommit > lastIndex {
@@ -573,6 +658,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 		// Regular Hearbeat message
 		if len(args.Entries) == 0 {
+			DPrintf("[%d] Server %d received Heartbeat message from %d\n", rf.currentTerm, rf.me, args.LeaderId)
 			return
 		}
 		// server has no logs yet
@@ -580,11 +666,35 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.Logs = append(rf.Logs, args.Entries...)
 		} else {
 			i := entry.LogIndex - rf.Logs[0].LogIndex + 1
-			rf.Logs = append(rf.Logs[:i], args.Entries...)
+			lastArgIndex := len(args.Entries) - 1
+			lastArgEntry := args.Entries[lastArgIndex]
+
+			if lastArgEntry.LogIndex > lastIndex || lastArgEntry.LogTerm > lastTerm {
+				rf.Logs = append(rf.Logs[:i], args.Entries...)
+			}
 		}
-		DPrintf("[%d] Appending Done for server %d index %d\n", rf.currentTerm, rf.me, lastIndex)
+		DPrintf("[%d] Server %d Log Size = %d\n", rf.currentTerm, rf.me, len(rf.Logs))
+		lastIndex, _ = rf.getlastLogInfo()
+		rf.commitIndex = args.LeaderCommit
+		if args.LeaderCommit > lastIndex {
+			rf.commitIndex = lastIndex
+		}
+		// DPrintf("[%d] Appending Done for server %d index %d\n", rf.currentTerm, rf.me, lastIndex)
 	} else {
-		reply.Success = false
+		//reply.Success = false
+		DPrintf("[%d] Server %d rejected server %d append, CurLogIndex %d curLogTerm %d VS recIndex %d recTerm %d", rf.currentTerm, rf.me, args.LeaderId, entry.LogIndex, entry.LogTerm, args.PrevLogIndex, args.PrevLogTerm)
+
+		reply.XLen = lastIndex
+		if lastIndex < args.PrevLogIndex {
+			reply.XTerm = -1
+			reply.XIndex = -1
+		} else {
+			_, entry := rf.getEntryAt(args.PrevLogIndex)
+			reply.XTerm = entry.LogTerm
+
+			_, entry = rf.getLowerBoundEntry(entry.LogTerm)
+			reply.XIndex = entry.LogIndex
+		}
 	}
 
 }
