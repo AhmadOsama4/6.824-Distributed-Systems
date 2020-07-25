@@ -149,6 +149,11 @@ func (rf *Raft) getEntryAt(index int) (bool, LogEntry) {
 		return false, LogEntry{}
 	}
 	i := index - rf.Logs[0].LogIndex
+
+	if i < 0 {
+		DPrintf("[%d] me %d index %d LogSize %d firstLogIndex %d\n", rf.me, rf.currentTerm, index, len(rf.Logs), rf.Logs[0].LogIndex)
+	}
+
 	return true, rf.Logs[i]
 }
 
@@ -242,6 +247,14 @@ func (rf *Raft) findTermHighestIndex(term int) (bool, LogEntry) {
 	return retBool, retEntry
 }
 
+// To be executed while holding the lock
+func (rf *Raft) updateTerm(term int) {
+	if term > rf.currentTerm {
+		rf.currentTerm = term
+		rf.votedFor = -1
+	}
+}
+
 // Send hearbeat request to follower servers
 // should not execute these fn while holding the mu lock
 func (rf *Raft) sendHeartbeats() {
@@ -300,6 +313,8 @@ func (rf *Raft) startElection() {
 	rf.currentTerm++
 	rf.votedFor = rf.me
 
+	rf.persist()
+
 	curTerm := rf.currentTerm
 	curIndex := rf.me
 	lastLogIndex, lastLogTerm := rf.getlastLogInfo()
@@ -344,7 +359,8 @@ func (rf *Raft) startElection() {
 					rf.mu.Lock()
 					DPrintf("Server %d is now follower\n", rf.me)
 					rf.currentState = FOLLOWER
-					rf.currentTerm = reply.Term
+					rf.updateTerm(reply.Term)
+					//rf.currentTerm = reply.Term
 					rf.persist()
 					rf.mu.Unlock()
 				} else {
@@ -421,7 +437,12 @@ func (rf *Raft) handleServerAppendLogs(server int) {
 	nextIndex := rf.nextIndex[server]
 	request.PrevLogIndex, request.PrevLogTerm = rf.getInfoAt(nextIndex - 1)
 
-	lastIndex, _ := rf.getlastLogInfo()
+	lastIndex, lastTerm := rf.getlastLogInfo()
+
+	if lastTerm != rf.currentTerm {
+		rf.mu.Unlock()
+		return
+	}
 
 	request.Entries = rf.getEntriesFromTo(nextIndex, lastIndex)
 	rf.mu.Unlock()
@@ -435,6 +456,14 @@ func (rf *Raft) handleServerAppendLogs(server int) {
 	}
 
 	rf.mu.Lock()
+
+	if reply.Term > rf.currentTerm {
+		rf.currentState = FOLLOWER
+		rf.updateTerm(reply.Term)
+		rf.persist()
+		rf.mu.Unlock()
+		return
+	}
 
 	if reply.Term > rf.currentTerm {
 		rf.currentState = FOLLOWER
@@ -522,8 +551,8 @@ func (rf *Raft) SendConfirmationsThread() {
 				_, entry := rf.getEntryAt(i)
 				apply.Command = entry.Command
 
-				rf.applyCh <- apply
 				DPrintf("Server %d sending confirmation to Service, index: %d command %v\n", rf.me, i, apply.Command)
+				rf.applyCh <- apply
 
 				rf.lastAppliedIndex = i
 			}
@@ -555,9 +584,12 @@ func (rf *Raft) UpdateLastCommitIndex() {
 					}
 				}
 
+				_, entry := rf.getEntryAt(i)
 				if replicatedCount > rf.numPeers/2 {
-					rf.commitIndex = i
-					DPrintf("Index %d is replicated on majority of servers\n", i)
+					if entry.LogTerm == rf.currentTerm {
+						rf.commitIndex = i
+						DPrintf("[%d] Server %d, Index %d is replicated on majority of servers\n", rf.currentTerm, rf.me, i)
+					}
 				} else {
 					break
 				}
@@ -637,7 +669,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	rf.currentState = FOLLOWER
-	rf.currentTerm = args.Term
+	rf.updateTerm(args.Term)
+	//rf.currentTerm = args.Term
 	reply.Term = rf.currentTerm
 	reply.Success = false
 
@@ -662,6 +695,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// Regular Hearbeat message
 		if len(args.Entries) == 0 {
 			DPrintf("[%d] Server %d received Heartbeat message from %d\n", rf.currentTerm, rf.me, args.LeaderId)
+			rf.persist()
 			return
 		}
 		// server has no logs yet
@@ -778,9 +812,11 @@ func (rf *Raft) readPersist(data []byte) {
 
 		log.Fatal("Cannot Decode Persistent State\n")
 	} else {
+		rf.mu.Lock()
 		rf.currentTerm = term
 		rf.votedFor = votedFor
 		rf.Logs = logs
+		rf.mu.Unlock()
 	}
 }
 
@@ -825,23 +861,29 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// 	rf.votedFor = -1
 	// 	rf.currentTerm = args.Term
 	// }
+	rf.updateTerm(args.Term)
 
 	lastLogIndex, lastLogTerm := rf.getlastLogInfo()
-	DPrintf("Vote req: lastindex - %d, lastterm %d VS me: index - %d, lastTerm %d\n", args.LastLogIndex, args.LastLogTerm, lastLogIndex, lastLogTerm)
-	//if rf.vo
-	if args.LastLogTerm > lastLogTerm || (args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex) {
-		reply.VoteGranted = true
-		rf.currentTerm = args.Term
-		reply.Term = rf.currentTerm
-		rf.currentState = FOLLOWER
+	DPrintf("Vote req: lastindex %d, lastterm %d VS me: index %d, lastTerm %d\n", args.LastLogIndex, args.LastLogTerm, lastLogIndex, lastLogTerm)
 
-		rf.votedFor = args.CandidateId
+	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
+		DPrintf("Vote Not granted yet votedFor: %d Term: %d\n", rf.votedFor, rf.currentTerm)
+		if args.LastLogTerm > lastLogTerm || (args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex) {
+			DPrintf("Vote granted to %d me: %d votedFor: %d currentTerm: %d RequestTerm: %d\n", args.CandidateId, rf.me, rf.votedFor, rf.currentTerm, args.Term)
+			reply.VoteGranted = true
+			rf.currentTerm = args.Term
+			reply.Term = rf.currentTerm
+			rf.currentState = FOLLOWER
 
-		rf.persist()
+			rf.votedFor = args.CandidateId
 
-		rf.UpdateLastHeartBeat()
-		DPrintf("Server %d voted for %d currentTerm %d\n", rf.me, args.CandidateId, rf.currentTerm)
+			//rf.persist()
+
+			rf.UpdateLastHeartBeat()
+			DPrintf("Server %d voted for %d currentTerm %d\n", rf.me, args.CandidateId, rf.currentTerm)
+		}
 	}
+	rf.persist()
 
 }
 
@@ -910,8 +952,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader = rf.currentState == LEADER
 
 	if isLeader {
-		DPrintf("Server %d Received Start Req Command %v\n", rf.me, command)
 		index = rf.getNextLogIndex()
+		DPrintf("[%d] Server %d Received Start Req Command %v Index %d\n", rf.currentTerm, rf.me, command, index)
 		term = rf.currentTerm
 		rf.ReplicateLogs(index, command)
 	}
@@ -973,15 +1015,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	DPrintf("\nNumber of peers: %d\n", rf.numPeers)
 
-	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
-
 	rf.UpdateLastHeartBeat()
 
 	go rf.CheckTimeout()
 	go rf.SendEmptyAppendIfLeader()
 	go rf.UpdateLastCommitIndex()
 	go rf.SendConfirmationsThread()
+
+	// initialize from state persisted before a crash
+	rf.readPersist(persister.ReadRaftState())
 
 	return rf
 }
