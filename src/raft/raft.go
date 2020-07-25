@@ -18,6 +18,7 @@ package raft
 //
 
 import (
+	"bytes"
 	"fmt"
 	"log"
 	"math/rand"
@@ -25,6 +26,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"../labgob"
 	"../labrpc"
 )
 
@@ -343,6 +345,7 @@ func (rf *Raft) startElection() {
 					DPrintf("Server %d is now follower\n", rf.me)
 					rf.currentState = FOLLOWER
 					rf.currentTerm = reply.Term
+					rf.persist()
 					rf.mu.Unlock()
 				} else {
 					DPrintf("Something wrong happened while voting")
@@ -484,7 +487,7 @@ func (rf *Raft) ReplicateLogs(index int, command interface{}) {
 	// request.Entries = []LogEntry{entry}
 
 	rf.Logs = append(rf.Logs, entry)
-
+	rf.persist()
 	//lastIndex, _ := rf.getlastLogInfo()
 	DPrintf("Log size for leader server %d = %d\n", rf.me, len(rf.Logs))
 
@@ -673,6 +676,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				rf.Logs = append(rf.Logs[:i], args.Entries...)
 			}
 		}
+
 		DPrintf("[%d] Server %d Log Size = %d\n", rf.currentTerm, rf.me, len(rf.Logs))
 		lastIndex, _ = rf.getlastLogInfo()
 		rf.commitIndex = args.LeaderCommit
@@ -696,6 +700,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			reply.XIndex = entry.LogIndex
 		}
 	}
+
+	rf.persist()
 
 }
 
@@ -727,6 +733,15 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.Logs)
+
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
@@ -749,6 +764,24 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	var term int
+	var votedFor int
+	var logs []LogEntry
+
+	if d.Decode(&term) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&logs) != nil {
+
+		log.Fatal("Cannot Decode Persistent State\n")
+	} else {
+		rf.currentTerm = term
+		rf.votedFor = votedFor
+		rf.Logs = logs
+	}
 }
 
 //
@@ -788,8 +821,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term < rf.currentTerm {
 		return
 	}
+	// if args.Term > rf.currentTerm {
+	// 	rf.votedFor = -1
+	// 	rf.currentTerm = args.Term
+	// }
+
 	lastLogIndex, lastLogTerm := rf.getlastLogInfo()
 	DPrintf("Vote req: lastindex - %d, lastterm %d VS me: index - %d, lastTerm %d\n", args.LastLogIndex, args.LastLogTerm, lastLogIndex, lastLogTerm)
+	//if rf.vo
 	if args.LastLogTerm > lastLogTerm || (args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex) {
 		reply.VoteGranted = true
 		rf.currentTerm = args.Term
@@ -797,6 +836,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.currentState = FOLLOWER
 
 		rf.votedFor = args.CandidateId
+
+		rf.persist()
+
 		rf.UpdateLastHeartBeat()
 		DPrintf("Server %d voted for %d currentTerm %d\n", rf.me, args.CandidateId, rf.currentTerm)
 	}
@@ -931,15 +973,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	DPrintf("\nNumber of peers: %d\n", rf.numPeers)
 
+	// initialize from state persisted before a crash
+	rf.readPersist(persister.ReadRaftState())
+
 	rf.UpdateLastHeartBeat()
 
 	go rf.CheckTimeout()
 	go rf.SendEmptyAppendIfLeader()
 	go rf.UpdateLastCommitIndex()
 	go rf.SendConfirmationsThread()
-
-	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
 
 	return rf
 }
