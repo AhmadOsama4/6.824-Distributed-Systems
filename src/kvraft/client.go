@@ -1,13 +1,19 @@
 package kvraft
 
-import "../labrpc"
-import "crypto/rand"
-import "math/big"
+import (
+	"crypto/rand"
+	"math/big"
+	"sync"
 
+	"../labrpc"
+)
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
+	mu        sync.Mutex
+	clientId  int64
+	requestId int64
 }
 
 func nrand() int64 {
@@ -21,7 +27,17 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
+	ck.clientId = nrand()
+	ck.requestId = 0
 	return ck
+}
+
+func (ck *Clerk) GetNewRequestId() int64 {
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
+	val := ck.requestId
+	ck.requestId++
+	return val
 }
 
 //
@@ -37,9 +53,30 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) Get(key string) string {
-
 	// You will have to modify this function.
-	return ""
+	DPrintf("[Client] Received Get for Key: %v\n", key)
+
+	args := GetArgs{}
+	reply := GetReply{}
+	args.Key = key
+	args.ClientId = ck.clientId
+	args.RequestId = ck.GetNewRequestId()
+
+	found := false
+	ret := ""
+	for !found {
+		for i, _ := range ck.servers {
+			ok := ck.servers[i].Call("KVServer.Get", &args, &reply)
+
+			if ok && reply.Err == OK {
+				found = true
+				ret = reply.Value
+				DPrintf("[Client] Get result for Key %v = (%v)\n", args.Key, reply.Value)
+				break
+			}
+		}
+	}
+	return ret
 }
 
 //
@@ -54,6 +91,28 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+	DPrintf("[Client] Received PutAppend for Key: %v Value: %v Op: %v\n", key, value, op)
+	args := PutAppendArgs{}
+	reply := PutAppendReply{}
+
+	args.Key = key
+	args.Value = value
+	args.Op = op
+	args.ClientId = ck.clientId
+	args.RequestId = ck.GetNewRequestId()
+
+	found := false
+
+	for !found {
+		for i, _ := range ck.servers {
+			ok := ck.servers[i].Call("KVServer.PutAppend", &args, &reply)
+
+			if ok && reply.Err == OK {
+				found = true
+				break
+			}
+		}
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {

@@ -1,15 +1,17 @@
 package kvraft
 
 import (
-	"../labgob"
-	"../labrpc"
 	"log"
-	"../raft"
 	"sync"
 	"sync/atomic"
+	"time"
+
+	"../labgob"
+	"../labrpc"
+	"../raft"
 )
 
-const Debug = 0
+const Debug = 1
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -18,11 +20,19 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
+const (
+	GET    = "Get"
+	PUT    = "Put"
+	APPEND = "Append"
+)
 
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Key   string
+	Value string
+	Type  string
 }
 
 type KVServer struct {
@@ -35,15 +45,120 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	kvMapper        map[string]string
+	indextoChMapper map[int]chan raft.ApplyMsg
 }
 
+// Time to wait for receiving confirmation from Raft peer
+const APPLY_WAIT_MS = 500
+
+func (kv *KVServer) waitForOpConfirmation(index int) bool {
+	ch := make(chan raft.ApplyMsg, 1)
+
+	kv.mu.Lock()
+	kv.indextoChMapper[index] = ch
+	kv.mu.Unlock()
+
+	ret := false
+
+	select {
+	case <-ch:
+		ret = true
+	case <-time.After(APPLY_WAIT_MS * time.Millisecond):
+	}
+
+	kv.mu.Lock()
+	delete(kv.indextoChMapper, index)
+	kv.mu.Unlock()
+
+	return ret
+}
+
+func (kv *KVServer) receiveApply() {
+	for {
+		msg := <-kv.applyCh
+		// Cast interface to Op
+		op := msg.Command.(Op)
+		index := msg.CommandIndex
+
+		DPrintf("[Server] Received Apply Msg of type %v for key %v\n", op.Type, op.Key)
+
+		kv.mu.Lock()
+		if op.Type == PUT {
+			kv.kvMapper[op.Key] = op.Value
+		} else if op.Type == APPEND {
+			if curVal, ok := kv.kvMapper[op.Key]; ok {
+				kv.kvMapper[op.Key] = curVal + op.Value
+			} else {
+				kv.kvMapper[op.Key] = op.Value
+			}
+		}
+
+		if ch, ok := kv.indextoChMapper[index]; ok {
+			ch <- msg
+		}
+		kv.mu.Unlock()
+	}
+}
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	DPrintf("[Server] Received Get for Key: %v\n", args.Key)
+	op := Op{}
+	op.Key = args.Key
+	op.Type = GET
+
+	index, _, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	isApplied := kv.waitForOpConfirmation(index)
+	ret := ""
+	reply.Err = ErrWrongLeader
+
+	if !isApplied {
+		return
+	}
+
+	DPrintf("[Server] Getting Value for Key: %v\n", args.Key)
+
+	kv.mu.Lock()
+	ret, ok := kv.kvMapper[args.Key]
+	kv.mu.Unlock()
+
+	if ok {
+		reply.Err = OK
+		reply.Value = ret
+		DPrintf("[Server] Key %v found value %v\n", args.Key, ret)
+	} else {
+		reply.Err = ErrNoKey
+		DPrintf("[Server] Key %v no value found\n", args.Key)
+	}
+
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	op := Op{}
+	op.Key = args.Key
+	op.Value = args.Value
+	op.Type = args.Op
+
+	index, _, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	reply.Err = ErrWrongLeader
+	isApplied := kv.waitForOpConfirmation(index)
+
+	if isApplied {
+		reply.Err = OK
+	}
+
 }
 
 //
@@ -96,6 +211,10 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
+	kv.kvMapper = make(map[string]string)
+	kv.indextoChMapper = make(map[int]chan raft.ApplyMsg)
+
+	go kv.receiveApply()
 
 	return kv
 }
