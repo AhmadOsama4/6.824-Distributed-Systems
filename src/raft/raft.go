@@ -152,6 +152,7 @@ func (rf *Raft) getEntryAt(index int) (bool, LogEntry) {
 
 	if i < 0 {
 		DPrintf("[%d] me %d index %d LogSize %d firstLogIndex %d\n", rf.me, rf.currentTerm, index, len(rf.Logs), rf.Logs[0].LogIndex)
+		return false, LogEntry{}
 	}
 
 	return true, rf.Logs[i]
@@ -177,7 +178,11 @@ func (rf *Raft) getEntriesFromTo(fromIndex int, toIndex int) []LogEntry {
 		j = len(rf.Logs)
 	}
 
-	return rf.Logs[i:j]
+	// Create a copy slice, to avoid passing by refrence
+	ret := make([]LogEntry, len(rf.Logs[i:j]))
+	copy(ret, rf.Logs[i:j])
+
+	return ret
 }
 
 // To be executed while holding the lock
@@ -320,7 +325,7 @@ func (rf *Raft) startElection() {
 	lastLogIndex, lastLogTerm := rf.getlastLogInfo()
 	rf.mu.Unlock()
 
-	log.Printf("Server %d is starting election curTerm: %d\n", curIndex, curTerm)
+	DPrintf("Server %d is starting election curTerm: %d\n", curIndex, curTerm)
 
 	var voteMu sync.Mutex
 	cond := sync.NewCond(&voteMu)
@@ -343,7 +348,7 @@ func (rf *Raft) startElection() {
 			request.LastLogIndex = lastLogIndex
 			request.LastLogTerm = lastLogTerm
 
-			log.Printf("Sever %d sending vote request to %d for term %d\n", curIndex, peerIndex, curTerm)
+			DPrintf("Sever %d sending vote request to %d for term %d\n", curIndex, peerIndex, curTerm)
 			ok := rf.sendRequestVote(peerIndex, &request, &reply)
 			//DPrintf("Vote req from %d to %d, term %d => %t\n", curIndex, peerIndex, curTerm, ok)
 
@@ -685,7 +690,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		(found && entry.LogIndex == args.PrevLogIndex && entry.LogTerm == args.PrevLogTerm)
 
 	if acceptAppend {
-		log.Printf("Server %d confirms server %d is leader for term %d\n", rf.me, args.LeaderId, args.Term)
+		DPrintf("Server %d confirms server %d is leader for term %d\n", rf.me, args.LeaderId, args.Term)
 		reply.Success = true
 		// Update latest committed index
 		rf.commitIndex = args.LeaderCommit
