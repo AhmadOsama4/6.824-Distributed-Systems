@@ -11,9 +11,10 @@ import (
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
-	mu        sync.Mutex
-	clientId  int64
-	requestId int64
+	mu         sync.Mutex
+	clientId   int64
+	requestId  int64
+	lastLeader int
 }
 
 func nrand() int64 {
@@ -28,7 +29,8 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck.servers = servers
 	// You'll have to add code here.
 	ck.clientId = nrand()
-	ck.requestId = 0
+	ck.requestId = 1
+	ck.lastLeader = 0
 	return ck
 }
 
@@ -54,28 +56,37 @@ func (ck *Clerk) GetNewRequestId() int64 {
 //
 func (ck *Clerk) Get(key string) string {
 	// You will have to modify this function.
-	DPrintf("[Client] Received Get for Key: %v\n", key)
 
 	args := GetArgs{}
 	reply := GetReply{}
 	args.Key = key
 	args.ClientId = ck.clientId
 	args.RequestId = ck.GetNewRequestId()
+	DPrintf("[Client %v] Received Get for Key: %v  RequestId %v\n", args.ClientId, key, args.RequestId)
 
-	found := false
 	ret := ""
-	for !found {
-		for i, _ := range ck.servers {
-			ok := ck.servers[i].Call("KVServer.Get", &args, &reply)
 
-			if ok && reply.Err == OK {
-				found = true
+	ck.mu.Lock()
+	lastLeader := ck.lastLeader
+	ck.mu.Unlock()
+
+	for i := lastLeader; ; i++ {
+		index := i % len(ck.servers)
+		DPrintf("[Client %v] Sending Get to server %v reqId %v, Key: %v\n", args.ClientId, index, args.RequestId, key)
+		ok := ck.servers[index].Call("KVServer.Get", &args, &reply)
+
+		if ok && reply.Err != ErrWrongLeader {
+			if reply.Err == OK {
 				ret = reply.Value
-				DPrintf("[Client] Get result for Key %v = (%v)\n", args.Key, reply.Value)
-				break
+				DPrintf("[Client %v] Get result for Key %v = (%v)\n", args.ClientId, args.Key, reply.Value)
 			}
+			ck.mu.Lock()
+			ck.lastLeader = index
+			ck.mu.Unlock()
+			break
 		}
 	}
+
 	return ret
 }
 
@@ -91,7 +102,6 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
-	DPrintf("[Client] Received PutAppend for Key: %v Value: %v Op: %v\n", key, value, op)
 	args := PutAppendArgs{}
 	reply := PutAppendReply{}
 
@@ -101,16 +111,23 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	args.ClientId = ck.clientId
 	args.RequestId = ck.GetNewRequestId()
 
-	found := false
+	DPrintf("[Client %v] Received PutAppend reqId %v for Key: %v Value: %v Op: %v\n", args.ClientId, args.RequestId, key, value, op)
 
-	for !found {
-		for i, _ := range ck.servers {
-			ok := ck.servers[i].Call("KVServer.PutAppend", &args, &reply)
+	ck.mu.Lock()
+	lastLeader := ck.lastLeader
+	ck.mu.Unlock()
 
-			if ok && reply.Err == OK {
-				found = true
-				break
-			}
+	for i := lastLeader; ; i++ {
+		index := i % len(ck.servers)
+		DPrintf("[Client %v] Sending PutAppend to server %v reqId %v, Key: %v, Value %v\n", args.ClientId, index, args.RequestId, key, value)
+		ok := ck.servers[index].Call("KVServer.PutAppend", &args, &reply)
+
+		if ok && reply.Err == OK {
+			ck.mu.Lock()
+			DPrintf("[Client %v] PutAppend completed server %v reqId %v. Key: %v, Value %v\n", args.ClientId, index, args.RequestId, key, value)
+			ck.lastLeader = index
+			ck.mu.Unlock()
+			break
 		}
 	}
 }

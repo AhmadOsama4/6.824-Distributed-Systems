@@ -30,9 +30,11 @@ type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
-	Key   string
-	Value string
-	Type  string
+	Key       string
+	Value     string
+	Type      string
+	RequestId int64
+	ClientId  int64
 }
 
 type KVServer struct {
@@ -45,18 +47,25 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	kvMapper        map[string]string
-	indextoChMapper map[int]chan raft.ApplyMsg
+	kvMapper           map[string]string
+	indextoChMapper    map[IndexId]chan raft.ApplyMsg
+	clientsLastRequest map[int64]int64
+}
+
+type IndexId struct {
+	Index     int
+	RequestId int64
+	ClientId  int64
 }
 
 // Time to wait for receiving confirmation from Raft peer
 const APPLY_WAIT_MS = 500
 
-func (kv *KVServer) waitForOpConfirmation(index int) bool {
+func (kv *KVServer) waitForOpConfirmation(indexId IndexId) bool {
 	ch := make(chan raft.ApplyMsg, 1)
 
 	kv.mu.Lock()
-	kv.indextoChMapper[index] = ch
+	kv.indextoChMapper[indexId] = ch
 	kv.mu.Unlock()
 
 	ret := false
@@ -68,7 +77,7 @@ func (kv *KVServer) waitForOpConfirmation(index int) bool {
 	}
 
 	kv.mu.Lock()
-	delete(kv.indextoChMapper, index)
+	delete(kv.indextoChMapper, indexId)
 	kv.mu.Unlock()
 
 	return ret
@@ -81,12 +90,25 @@ func (kv *KVServer) receiveApply() {
 		op := msg.Command.(Op)
 		index := msg.CommandIndex
 
-		DPrintf("[Server] Received Apply Msg of type %v for key %v\n", op.Type, op.Key)
+		clientId := op.ClientId
+		requestId := op.RequestId
+		DPrintf("[Server] Received Apply Msg of type %v for key %v clientId %v reqId %v\n", op.Type, op.Key, clientId, requestId)
 
 		kv.mu.Lock()
-		if op.Type == PUT {
+
+		ignore := false
+
+		if clientLastRequest, found := kv.clientsLastRequest[clientId]; found {
+			ignore = clientLastRequest >= requestId
+		}
+
+		if !ignore {
+			kv.clientsLastRequest[clientId] = requestId
+		}
+
+		if op.Type == PUT && !ignore {
 			kv.kvMapper[op.Key] = op.Value
-		} else if op.Type == APPEND {
+		} else if op.Type == APPEND && !ignore {
 			if curVal, ok := kv.kvMapper[op.Key]; ok {
 				kv.kvMapper[op.Key] = curVal + op.Value
 			} else {
@@ -94,7 +116,12 @@ func (kv *KVServer) receiveApply() {
 			}
 		}
 
-		if ch, ok := kv.indextoChMapper[index]; ok {
+		indexId := IndexId{}
+		indexId.ClientId = clientId
+		indexId.RequestId = requestId
+		indexId.Index = index
+
+		if ch, ok := kv.indextoChMapper[indexId]; ok {
 			ch <- msg
 		}
 		kv.mu.Unlock()
@@ -107,6 +134,8 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	op := Op{}
 	op.Key = args.Key
 	op.Type = GET
+	op.RequestId = args.RequestId
+	op.ClientId = args.ClientId
 
 	index, _, isLeader := kv.rf.Start(op)
 	if !isLeader {
@@ -114,7 +143,12 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		return
 	}
 
-	isApplied := kv.waitForOpConfirmation(index)
+	indexId := IndexId{}
+	indexId.Index = index
+	indexId.ClientId = args.ClientId
+	indexId.RequestId = args.RequestId
+
+	isApplied := kv.waitForOpConfirmation(indexId)
 	ret := ""
 	reply.Err = ErrWrongLeader
 
@@ -145,6 +179,8 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	op.Key = args.Key
 	op.Value = args.Value
 	op.Type = args.Op
+	op.ClientId = args.ClientId
+	op.RequestId = args.RequestId
 
 	index, _, isLeader := kv.rf.Start(op)
 	if !isLeader {
@@ -152,9 +188,14 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		return
 	}
 
-	reply.Err = ErrWrongLeader
-	isApplied := kv.waitForOpConfirmation(index)
+	indexId := IndexId{}
+	indexId.Index = index
+	indexId.ClientId = args.ClientId
+	indexId.RequestId = args.RequestId
 
+	isApplied := kv.waitForOpConfirmation(indexId)
+
+	reply.Err = ErrWrongLeader
 	if isApplied {
 		reply.Err = OK
 	}
@@ -212,7 +253,8 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// You may need initialization code here.
 	kv.kvMapper = make(map[string]string)
-	kv.indextoChMapper = make(map[int]chan raft.ApplyMsg)
+	kv.indextoChMapper = make(map[IndexId]chan raft.ApplyMsg)
+	kv.clientsLastRequest = make(map[int64]int64)
 
 	go kv.receiveApply()
 
