@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -44,7 +45,9 @@ type KVServer struct {
 	applyCh chan raft.ApplyMsg
 	dead    int32 // set by Kill()
 
-	maxraftstate int // snapshot if log grows this big
+	maxraftstate     int // snapshot if log grows this big
+	lastAppliedIndex int
+	lastAppliedTerm  int
 
 	// Your definitions here.
 	kvMapper           map[string]string
@@ -83,18 +86,75 @@ func (kv *KVServer) waitForOpConfirmation(indexId IndexId) bool {
 	return ret
 }
 
+func (kv *KVServer) checkNewSnapshotNeeded() {
+	if kv.maxraftstate != -1 && kv.maxraftstate > kv.rf.GetRaftStateSize() {
+		go func() {
+			kv.mu.Lock()
+			defer kv.mu.Unlock()
+
+			w := new(bytes.Buffer)
+			e := labgob.NewEncoder(w)
+
+			e.Encode(kv.kvMapper)
+			e.Encode(kv.clientsLastRequest)
+			e.Encode(kv.lastAppliedIndex)
+			e.Encode(kv.lastAppliedTerm)
+
+			data := w.Bytes()
+			DPrintf("[Server] Sending Snapshot to Raft peer %d", kv.me)
+			kv.rf.SaveSnapshotData(data, kv.lastAppliedIndex, kv.lastAppliedTerm)
+		}()
+	}
+}
+
+func (kv *KVServer) applySnapshot() {
+	data := kv.rf.GetSnapshotData()
+	if data == nil || len(data) < 1 {
+		return
+	}
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	var mapper map[string]string
+	var lastReq map[int64]int64
+	var lastIndex int
+	var lastTerm int
+
+	if d.Decode(mapper) != nil ||
+		d.Decode(lastReq) != nil ||
+		d.Decode(lastIndex) != nil ||
+		d.Decode(lastTerm) != nil {
+		log.Fatalf("[Server] Cannot Decode received snaphsot")
+	} else {
+		kv.mu.Lock()
+		kv.kvMapper = mapper
+		kv.clientsLastRequest = lastReq
+		kv.lastAppliedIndex = lastIndex
+		kv.lastAppliedTerm = lastTerm
+		kv.mu.Unlock()
+	}
+}
+
 func (kv *KVServer) receiveApply() {
 	for {
 		msg := <-kv.applyCh
+		DPrintf("[Server] Received Apply Msg, isSnapshot %v\n", msg.IsSnapshot)
+		if msg.IsSnapshot {
+			go kv.applySnapshot()
+			continue
+		}
 		// Cast interface to Op
 		op := msg.Command.(Op)
 		index := msg.CommandIndex
+		term := msg.CommandTerm
 
 		clientId := op.ClientId
 		requestId := op.RequestId
 		DPrintf("[Server] Received Apply Msg of type %v for key %v clientId %v reqId %v\n", op.Type, op.Key, clientId, requestId)
 
 		kv.mu.Lock()
+		kv.lastAppliedIndex = index
+		kv.lastAppliedTerm = term
 
 		ignore := false
 
@@ -115,6 +175,8 @@ func (kv *KVServer) receiveApply() {
 				kv.kvMapper[op.Key] = op.Value
 			}
 		}
+
+		kv.checkNewSnapshotNeeded()
 
 		indexId := IndexId{}
 		indexId.ClientId = clientId
@@ -181,6 +243,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	op.Type = args.Op
 	op.ClientId = args.ClientId
 	op.RequestId = args.RequestId
+	DPrintf("[Server %d] Received PutAppend for Key %v, value %v", kv.me, op.Key, op.Value)
 
 	index, _, isLeader := kv.rf.Start(op)
 	if !isLeader {
@@ -256,6 +319,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.indextoChMapper = make(map[IndexId]chan raft.ApplyMsg)
 	kv.clientsLastRequest = make(map[int64]int64)
 
+	kv.applySnapshot()
 	go kv.receiveApply()
 
 	return kv

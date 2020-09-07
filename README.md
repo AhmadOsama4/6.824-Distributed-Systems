@@ -14,8 +14,31 @@ Personal Solution to MIT's course 6.824-Distributed-Systems Lab, [Spring 2020](h
 
 ## Labs Details
 ### Lab 1: MapReduce
+Simple implementation for [MapReduce](https://pdos.csail.mit.edu/6.824/papers/mapreduce.pdf)
 
 ### Lab 2: Raft
+Some issues that I encountered when implementing this Lab.
+#### Part 2A
 
+Tip #1
+Do not check for a timeout using a sleep as this could lead to unexpected timeouts
+```go
+    timeoutTime := time.Now() + RANDOM_TIME
 
+    for {
+        if time.Now().Sub(timeoutTime) {
+            // start new election
+        }
+
+        time.Sleep(sleepPeriod)
+    }
+```
+
+### Lab 3
+#### Part A
+Why the read operation has to be replicated and not just return the value in the Leader KV Storage ?
+As mentioned in Raft's paper section 8:
+> Read-only operations can be handled without writing
+anything into the log. However, with no additional measures, this would run the risk of returning stale data, since
+the leader responding to the request might have been superseded by a newer leader of which it is unaware.
 
