@@ -12,7 +12,7 @@ import (
 	"../raft"
 )
 
-const Debug = 1
+const Debug = 0
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -95,10 +95,10 @@ func (kv *KVServer) checkNewSnapshotNeeded() {
 			w := new(bytes.Buffer)
 			e := labgob.NewEncoder(w)
 
-			e.Encode(kv.kvMapper)
-			e.Encode(kv.clientsLastRequest)
 			e.Encode(kv.lastAppliedIndex)
 			e.Encode(kv.lastAppliedTerm)
+			e.Encode(kv.kvMapper)
+			e.Encode(kv.clientsLastRequest)
 
 			data := w.Bytes()
 			DPrintf("[Server] Sending Snapshot to Raft peer %d", kv.me)
@@ -120,11 +120,11 @@ func (kv *KVServer) applySnapshot() {
 	var lastIndex int
 	var lastTerm int
 
-	if d.Decode(mapper) != nil ||
-		d.Decode(lastReq) != nil ||
-		d.Decode(lastIndex) != nil ||
-		d.Decode(lastTerm) != nil {
-		log.Fatalf("[Server] Cannot Decode received snaphsot")
+	if d.Decode(&lastIndex) != nil ||
+		d.Decode(&lastTerm) != nil ||
+		d.Decode(&mapper) != nil ||
+		d.Decode(&lastReq) != nil {
+		log.Fatalf("[Server] Cannot Decode lastReq")
 	} else {
 		kv.mu.Lock()
 		kv.kvMapper = mapper
