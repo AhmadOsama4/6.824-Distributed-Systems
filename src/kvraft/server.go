@@ -101,7 +101,7 @@ func (kv *KVServer) checkNewSnapshotNeeded() {
 			e.Encode(kv.clientsLastRequest)
 
 			data := w.Bytes()
-			DPrintf("[Server] Sending Snapshot to Raft peer %d", kv.me)
+			DPrintf("[Server %d] Sending Snapshot to Raft peer", kv.me)
 			kv.rf.SaveSnapshotData(data, kv.lastAppliedIndex, kv.lastAppliedTerm)
 		}()
 	}
@@ -124,13 +124,14 @@ func (kv *KVServer) applySnapshot() {
 		d.Decode(&lastTerm) != nil ||
 		d.Decode(&mapper) != nil ||
 		d.Decode(&lastReq) != nil {
-		log.Fatalf("[Server] Cannot Decode lastReq")
+		log.Fatalf("[Server %d] Cannot Decode lastReq", kv.me)
 	} else {
 		kv.mu.Lock()
 		kv.kvMapper = mapper
 		kv.clientsLastRequest = lastReq
 		kv.lastAppliedIndex = lastIndex
 		kv.lastAppliedTerm = lastTerm
+		DPrintf("[Server %d] Snapshot applied to Server", kv.me)
 		kv.mu.Unlock()
 	}
 }
@@ -138,9 +139,9 @@ func (kv *KVServer) applySnapshot() {
 func (kv *KVServer) receiveApply() {
 	for {
 		msg := <-kv.applyCh
-		DPrintf("[Server] Received Apply Msg, isSnapshot %v\n", msg.IsSnapshot)
+		DPrintf("[Server %d] Received Apply Msg, isSnapshot %v\n", kv.me, msg.IsSnapshot)
 		if msg.IsSnapshot {
-			go kv.applySnapshot()
+			kv.applySnapshot()
 			continue
 		}
 		// Cast interface to Op
@@ -150,7 +151,7 @@ func (kv *KVServer) receiveApply() {
 
 		clientId := op.ClientId
 		requestId := op.RequestId
-		DPrintf("[Server] Received Apply Msg of type %v for key %v clientId %v reqId %v\n", op.Type, op.Key, clientId, requestId)
+		DPrintf("[Server %d] Received Apply Msg of type %v for key %v clientId %v reqId %v\n", kv.me, op.Type, op.Key, clientId, requestId)
 
 		kv.mu.Lock()
 		kv.lastAppliedIndex = index
@@ -192,7 +193,7 @@ func (kv *KVServer) receiveApply() {
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
-	DPrintf("[Server] Received Get for Key: %v\n", args.Key)
+	DPrintf("[Server %d] Received Get for Key: %v\n", kv.me, args.Key)
 	op := Op{}
 	op.Key = args.Key
 	op.Type = GET
@@ -218,19 +219,20 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		return
 	}
 
-	DPrintf("[Server] Getting Value for Key: %v\n", args.Key)
+	DPrintf("[Server %d] Getting Value for Key: %v\n", kv.me, args.Key)
 
 	kv.mu.Lock()
 	ret, ok := kv.kvMapper[args.Key]
+	DPrintf("[Server %d] Ok %v Key %v Value %v", kv.me, ok, args.Key, ret)
 	kv.mu.Unlock()
 
 	if ok {
 		reply.Err = OK
 		reply.Value = ret
-		DPrintf("[Server] Key %v found value %v\n", args.Key, ret)
+		DPrintf("[Server %d] Key %v found value %v\n", kv.me, args.Key, ret)
 	} else {
 		reply.Err = ErrNoKey
-		DPrintf("[Server] Key %v no value found\n", args.Key)
+		DPrintf("[Server %d] Key %v no value found\n", kv.me, args.Key)
 	}
 
 }
