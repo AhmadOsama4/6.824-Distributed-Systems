@@ -87,13 +87,16 @@ func (kv *KVServer) waitForOpConfirmation(indexId IndexId) bool {
 }
 
 func (kv *KVServer) checkNewSnapshotNeeded() {
-	if kv.maxraftstate != -1 && kv.maxraftstate > kv.rf.GetRaftStateSize() {
+	if kv.maxraftstate != -1 && kv.maxraftstate < kv.rf.GetRaftStateSize() {
+		DPrintf("[Server %d] Sending Snapshot to Raft peer, index: %v, term: %v, LogSize: %v", kv.me, kv.lastAppliedIndex, kv.lastAppliedTerm, kv.rf.GetRaftStateSize())
 		go func() {
 			kv.mu.Lock()
-			defer kv.mu.Unlock()
 
 			w := new(bytes.Buffer)
 			e := labgob.NewEncoder(w)
+
+			lastIndex := kv.lastAppliedIndex
+			lastTerm := kv.lastAppliedTerm
 
 			e.Encode(kv.lastAppliedIndex)
 			e.Encode(kv.lastAppliedTerm)
@@ -101,8 +104,10 @@ func (kv *KVServer) checkNewSnapshotNeeded() {
 			e.Encode(kv.clientsLastRequest)
 
 			data := w.Bytes()
-			DPrintf("[Server %d] Sending Snapshot to Raft peer", kv.me)
-			kv.rf.SaveSnapshotData(data, kv.lastAppliedIndex, kv.lastAppliedTerm)
+
+			kv.mu.Unlock()
+
+			kv.rf.SaveSnapshotData(data, lastIndex, lastTerm)
 		}()
 	}
 }

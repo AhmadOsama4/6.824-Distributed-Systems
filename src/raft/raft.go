@@ -190,7 +190,7 @@ func (rf *Raft) getEntryAt(index int) (bool, LogEntry) {
 	}
 
 	if i < 0 {
-		DPrintf("[%d] me %d index %d LogSize %d firstLogIndex %d\n", rf.me, rf.currentTerm, index, len(rf.Logs), rf.Logs[0].LogIndex)
+		DPrintf("[WARN][Raft %d] curTerm %d index %d LogSize %d firstLogIndex %d\n", rf.me, rf.currentTerm, index, len(rf.Logs), rf.Logs[0].LogIndex)
 		return false, LogEntry{}
 	}
 
@@ -327,7 +327,7 @@ func (rf *Raft) discardLogsBeforeIndex(index int) {
 	} else {
 		rf.Logs = rf.Logs[upperIndex:]
 	}
-	DPrintf("Logs discarded before index %d, logLength %d\n", index, len(rf.Logs))
+	DPrintf("[Raft %d] Logs discarded before index %d, logLength %d\n", rf.me, index, len(rf.Logs))
 }
 
 // To be executed while holding lock
@@ -348,6 +348,12 @@ func (rf *Raft) GetRaftStateData() []byte {
 func (rf *Raft) SaveSnapshotData(snapshotData []byte, index int, term int) {
 	DPrintf("[Raft %d] received snapshot at index %d term %d\n", rf.me, index, term)
 	rf.mu.Lock()
+
+	if index <= rf.lastIncludedIndex {
+		rf.mu.Unlock()
+		return
+	}
+
 	rf.discardLogsBeforeIndex(index)
 
 	rf.lastIncludedIndex = index
@@ -356,9 +362,8 @@ func (rf *Raft) SaveSnapshotData(snapshotData []byte, index int, term int) {
 	//rf.currentTerm = term
 	raftState := rf.GetRaftStateData()
 
-	rf.persister.SaveStateAndSnapshot(raftState, snapshotData)
 	rf.mu.Unlock()
-
+	rf.persister.SaveStateAndSnapshot(raftState, snapshotData)
 }
 
 func (rf *Raft) GetSnapshotData() []byte {
@@ -721,8 +726,7 @@ func (rf *Raft) SendConfirmationsThread() {
 				apply.Command = entry.Command
 				apply.IsSnapshot = false
 
-				//log.Printf("Server %d sending confirmation to Service, index: %d command %v\n", rf.me, i, apply.Command)
-				DPrintf("Server %d sending confirmation to Service, index: %d command %v\n", rf.me, i, apply.Command)
+				DPrintf("[Raft %d] sending confirmation to Service lastIncIndx %d LogSize %d, index: %d command %v\n", rf.me, rf.lastIncludedIndex, len(rf.Logs), i, apply.Command)
 				rf.applyCh <- apply
 
 				rf.lastAppliedIndex = i
@@ -944,10 +948,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotRequest, reply *InstallSnapshotReply) {
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	DPrintf("[Raft %d] Received Install Snapshot index %d\n", rf.me, args.LastIncludedIndex)
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
+		rf.mu.Unlock()
 		return
 	}
 	rf.UpdateLastHeartBeat()
@@ -961,6 +965,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotRequest, reply *InstallSnap
 	rf.commitIndex = rf.lastIncludedIndex
 
 	raftState := rf.GetRaftStateData()
+	rf.mu.Unlock()
 	rf.persister.SaveStateAndSnapshot(raftState, args.Data)
 }
 
@@ -1113,8 +1118,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			rf.currentState = FOLLOWER
 
 			rf.votedFor = args.CandidateId
-
-			//rf.persist()
 
 			rf.UpdateLastHeartBeat()
 			DPrintf("Server %d voted for %d currentTerm %d\n", rf.me, args.CandidateId, rf.currentTerm)
