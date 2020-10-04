@@ -50,7 +50,7 @@ type IndexId struct {
 }
 
 type Response struct {
-	Err   string
+	Err   Err
 	Value interface{}
 }
 
@@ -70,7 +70,6 @@ func (sm *ShardMaster) getOpConfirmationWithTimeout(indexId IndexId) Response {
 	case ret = <-ch:
 	case <-time.After(APPLY_WAIT_MS * time.Millisecond):
 	}
-
 	sm.mu.Lock()
 	delete(sm.indextoChMapper, indexId)
 	sm.mu.Unlock()
@@ -94,6 +93,10 @@ type Op struct {
 func (sm *ShardMaster) rebalanceShards(config *Config) {
 	numGroups := len(config.Groups)
 
+	if numGroups == 0 {
+		return
+	}
+
 	gids := []int{}
 	for gid, _ := range config.Groups {
 		gids = append(gids, gid)
@@ -101,14 +104,14 @@ func (sm *ShardMaster) rebalanceShards(config *Config) {
 	sort.Ints(gids)
 
 	avgPerGroup := NShards / numGroups
-	limit := avgPerGroup * NShards
+	limit := avgPerGroup * numGroups
 	for i := 0; i < limit; i++ {
-		groupId := gids[int(NShards/avgPerGroup)]
+		groupId := gids[int(i/avgPerGroup)]
 		config.Shards[i] = groupId
 	}
 
 	g := 0
-	for i := avgPerGroup * NShards; i < NShards; i++ {
+	for i := avgPerGroup * numGroups; i < NShards; i++ {
 		config.Shards[i] = gids[g]
 		g++
 	}
@@ -210,20 +213,21 @@ func (sm *ShardMaster) receiveApply() {
 			ignore = clientLastRequest >= requestId
 		}
 
-		if !ignore {
-			sm.clientsLastRequest[clientId] = requestId
-		}
-
 		response := Response{ErrWrongLeader, nil}
 
-		if msgType == JOIN {
-			response = sm.performJoin(op.Servers)
-		} else if msgType == LEAVE {
-			response = sm.performLeave(op.GIDs)
-		} else if msgType == MOVE {
-			response = sm.performMove(op.GID, op.Shard)
-		} else if msgType == QUERY {
-			response = sm.performQuery(op.ConfigNum)
+		if !ignore {
+			sm.clientsLastRequest[clientId] = requestId
+
+			if msgType == JOIN {
+				response = sm.performJoin(op.Servers)
+			} else if msgType == LEAVE {
+				response = sm.performLeave(op.GIDs)
+			} else if msgType == MOVE {
+				response = sm.performMove(op.GID, op.Shard)
+			} else if msgType == QUERY {
+				response = sm.performQuery(op.ConfigNum)
+				DPrintf("[SM Server %v] Query Response %v %v\n", sm.me, response.Err, response.Value)
+			}
 		}
 
 		indexId := IndexId{index, clientId, requestId}
@@ -242,6 +246,7 @@ func (sm *ShardMaster) Join(args *JoinArgs, reply *JoinReply) {
 	op.RequestId = args.RequestId
 	op.ClientId = args.ClientId
 	op.Servers = args.Servers
+	DPrintf("[SM Server %v] Received Join Request, number of server: %v\n", sm.me, len(args.Servers))
 
 	index, _, isLeader := sm.rf.Start(op)
 
@@ -257,12 +262,12 @@ func (sm *ShardMaster) Join(args *JoinArgs, reply *JoinReply) {
 	response := sm.getOpConfirmationWithTimeout(indexId)
 
 	if response.Err != OK {
+		reply.Err = response.Err
 		return
 	}
 
 	reply.Err = OK
 	reply.WrongLeader = false
-
 }
 
 func (sm *ShardMaster) Leave(args *LeaveArgs, reply *LeaveReply) {
@@ -272,6 +277,7 @@ func (sm *ShardMaster) Leave(args *LeaveArgs, reply *LeaveReply) {
 	op.RequestId = args.RequestId
 	op.ClientId = args.ClientId
 	op.GIDs = args.GIDs
+	DPrintf("[SM Server %v] Received Leave Request for groups: %v\n", sm.me, args.GIDs)
 
 	index, _, isLeader := sm.rf.Start(op)
 
@@ -287,6 +293,7 @@ func (sm *ShardMaster) Leave(args *LeaveArgs, reply *LeaveReply) {
 	response := sm.getOpConfirmationWithTimeout(indexId)
 
 	if response.Err != OK {
+		reply.Err = response.Err
 		return
 	}
 
@@ -303,6 +310,7 @@ func (sm *ShardMaster) Move(args *MoveArgs, reply *MoveReply) {
 	op.ClientId = args.ClientId
 	op.GID = args.GID
 	op.Shard = args.Shard
+	DPrintf("[SM Server %v] Received Move Request, Shard: %v, GID: %v\n", sm.me, args.Shard, args.GID)
 
 	index, _, isLeader := sm.rf.Start(op)
 
@@ -318,6 +326,7 @@ func (sm *ShardMaster) Move(args *MoveArgs, reply *MoveReply) {
 	response := sm.getOpConfirmationWithTimeout(indexId)
 
 	if response.Err != OK {
+		reply.Err = response.Err
 		return
 	}
 
@@ -328,10 +337,11 @@ func (sm *ShardMaster) Move(args *MoveArgs, reply *MoveReply) {
 func (sm *ShardMaster) Query(args *QueryArgs, reply *QueryReply) {
 	// Your code here.
 	op := Op{}
-	op.Type = MOVE
+	op.Type = QUERY
 	op.RequestId = args.RequestId
 	op.ClientId = args.ClientId
 	op.ConfigNum = args.Num
+	DPrintf("[SM Server %v] Received Query Request, queryNum: %v\n", sm.me, args.Num)
 
 	index, _, isLeader := sm.rf.Start(op)
 
@@ -347,14 +357,13 @@ func (sm *ShardMaster) Query(args *QueryArgs, reply *QueryReply) {
 	response := sm.getOpConfirmationWithTimeout(indexId)
 
 	if response.Err != OK {
+		reply.Err = response.Err
 		return
 	}
 
 	reply.Err = OK
 	reply.WrongLeader = false
-	sm.mu.Lock()
-	reply.Config = sm.configs[args.Num]
-	sm.mu.Unlock()
+	reply.Config = response.Value.(Config)
 }
 
 //
