@@ -311,6 +311,14 @@ func (rf *Raft) getUpperboudIndex(index int) int {
 	return ret
 }
 
+func (rf *Raft) IsLeader() bool {
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	return rf.currentState == LEADER
+}
+
 // To be executed while holding the lock
 func (rf *Raft) updateTerm(term int) {
 	if term > rf.currentTerm {
