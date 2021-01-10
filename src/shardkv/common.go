@@ -66,7 +66,6 @@ type GetShardsReply struct {
 }
 
 type KeyMigratingData struct {
-	Value     string
-	RequestId int64
-	ClientId  int64
+	Value             string
+	ClientLastRequest map[int64]int64
 }

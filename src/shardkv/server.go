@@ -28,13 +28,14 @@ type Op struct {
 	Type       string
 	RequestId  int64
 	ClientId   int64
+	ConfigNum  int
 	NewConfing shardmaster.Config
 }
 
-type KeyLastRequestInfo struct {
-	RequestId int64
-	ClientId  int64
-}
+// type KeyLastRequestInfo struct {
+// 	RequestId int64
+// 	ClientId  int64
+// }
 
 type ShardKV struct {
 	mu           sync.Mutex
@@ -62,7 +63,7 @@ type ShardKV struct {
 	clientsLastRequest map[int64]int64
 	kvMapper           map[string]string
 
-	keyLastRequestInfo map[string]KeyLastRequestInfo // last RequestId and ClientId that accessed this key
+	keyClientLastRequestId map[string]map[int64]int64 // last RequestId for each ClientId that accessed this key
 }
 
 const Debug = 1
@@ -119,12 +120,12 @@ func keyBelongsToMigratingShard(key string, migratingShards []int) (bool, int) {
 	return false, -1
 }
 
-func (kv *ShardKV) fetchMissingShardsFromSingleGroup(gid int, shardsToGet []int, configNum int) {
+func (kv *ShardKV) fetchMissingShardsFromSingleGroup(gid int, shardsToGet []int, newConfig shardmaster.Config) {
 	if len(shardsToGet) == 0 {
 		return
 	}
 	args := GetShardsArgs{}
-	args.ConfigNum = configNum
+	args.ConfigNum = newConfig.Num - 1
 	args.SendingShardId = kv.me
 	args.Shards = shardsToGet
 	DPrintf("[KV GID %d Server %d] Fetching shards: %v from GID %v\n", kv.gid, kv.me, shardsToGet, gid)
@@ -138,18 +139,23 @@ func (kv *ShardKV) fetchMissingShardsFromSingleGroup(gid int, shardsToGet []int,
 			for si := 0; si < len(servers); si++ {
 				srv := kv.make_end(servers[si])
 				var reply GetShardsReply
+				DPrintf("[KV GID %d Server %d] Sending RequestShards to GID %v Config %v for %v\n", kv.gid, kv.me, gid, args.ConfigNum, shardsToGet)
 				ok := srv.Call("ShardKV.RequestShards", &args, &reply)
 
-				if ok && reply.Err == OK && reply.ConfigNum == configNum {
+				if ok && reply.Err == OK && reply.ConfigNum == newConfig.Num-1 {
 					kv.mu.Lock()
-					DPrintf("[KV GID %d Server %d] Received shards: %v from GID %v\n", kv.gid, kv.me, shardsToGet, gid)
+					DPrintf("[KV GID %d Server %d] Received shards: %v from GID %v, Data: %v\n", kv.gid, kv.me, shardsToGet, gid, reply.Data)
 					for k, keyData := range reply.Data {
+						DPrintf("[KV GID %d Server %d] Received K: %v, V: %v\n", kv.gid, kv.me, k, keyData.Value)
 						kv.kvMapper[k] = keyData.Value
-						lastReqId, found := kv.clientsLastRequest[keyData.ClientId]
-						if !found || lastReqId < keyData.RequestId {
-							kv.clientsLastRequest[keyData.ClientId] = keyData.RequestId
+						kv.keyClientLastRequestId[k] = make(map[int64]int64)
+						for clientId, reqId := range keyData.ClientLastRequest {
+							lastReqId, found := kv.clientsLastRequest[clientId]
+							if !found || lastReqId < reqId {
+								kv.clientsLastRequest[clientId] = reqId
+								kv.keyClientLastRequestId[k][clientId] = reqId
+							}
 						}
-						kv.keyLastRequestInfo[k] = KeyLastRequestInfo{keyData.RequestId, keyData.ClientId}
 					}
 					for _, shard := range shardsToGet {
 						kv.shardAwaitingData[shard] = false
@@ -164,62 +170,95 @@ func (kv *ShardKV) fetchMissingShardsFromSingleGroup(gid int, shardsToGet []int,
 	}
 }
 
-func (kv *ShardKV) fetchMissingShards(shardsToGet []int) {
+func (kv *ShardKV) fetchMissingShards(shardsToGet []int, configChan chan bool, newConfig shardmaster.Config) {
 	if len(shardsToGet) == 0 {
+		configChan <- true
 		return
 	}
-	DPrintf("[KV GID %d Server %d] Fetching missing shards: %v\n", kv.gid, kv.me, shardsToGet)
+	kv.mu.Lock()
+	currentConfig := getConfigCopy(kv.config)
+	DPrintf("[KV GID %d Server %d] Fetching missing shards, Config: %v, Shards: %v\n", kv.gid, kv.me, currentConfig.Num, shardsToGet)
+	kv.mu.Unlock()
+	if currentConfig.Num == 0 {
+		configChan <- true
+		return
+	}
+
 	groupShards := make(map[int][]int)
 	for _, shard := range shardsToGet {
-		groupId := kv.config.Shards[shard]
+		groupId := currentConfig.Shards[shard]
 		if _, found := groupShards[groupId]; !found {
 			groupShards[groupId] = make([]int, 0)
 		}
 		groupShards[groupId] = append(groupShards[groupId], shard)
 	}
 
+	var wg sync.WaitGroup
 	for groupId, shards := range groupShards {
-		go kv.fetchMissingShardsFromSingleGroup(groupId, shards, kv.config.Num)
+		wg.Add(1)
+		go func(gid int, shardsToGet []int, newConfig shardmaster.Config) {
+			kv.fetchMissingShardsFromSingleGroup(gid, shardsToGet, newConfig)
+			wg.Done()
+		}(groupId, shards, newConfig)
 	}
+	wg.Wait()
+	configChan <- true
+
 }
 
 func (kv *ShardKV) handleConfigChange(newConfig shardmaster.Config) {
-	if newConfig.Num <= kv.config.Num || kv.isMigrating {
+	kv.mu.Lock()
+	currentConfigNum := kv.config.Num
+	if newConfig.Num <= currentConfigNum {
+		kv.mu.Unlock()
 		return
 	}
 	DPrintf("[KV GID %d Server %d] Changing Configuration from %d to %d\n", kv.gid, kv.me, kv.config.Num, newConfig.Num)
+	// kv.isMigrating = true
 
-	// var shardsLeaving []int
-	// var shardsToGet []int
+	var shardsLeaving []int
+	var shardsToGet []int
 
-	kv.shardMigratingKeys[newConfig.Num] = make(map[int]map[string]KeyMigratingData)
+	kv.shardMigratingKeys[currentConfigNum] = make(map[int]map[string]KeyMigratingData)
 	kv.shardAwaitingData = make(map[int]bool)
 
-	// for shardNum := 0; shardNum < shardmaster.NShards; shardNum++ {
-	// 	if kv.isLeavingShard(shardNum, newConfig) {
-	// 		shardsLeaving = append(shardsLeaving, shardNum)
-	// 		kv.shardMigratingKeys[newConfig.Num][shardNum] = make(map[string]KeyMigratingData)
-	// 		DPrintf("Here1")
-	// 	}
-	// 	if kv.isAwaitingShard(shardNum, newConfig) {
-	// 		shardsToGet = append(shardsToGet, shardNum)
-	// 		kv.shardAwaitingData[shardNum] = true
-	// 		DPrintf("Here2")
-	// 	}
-	// }
+	for shardNum := 0; shardNum < shardmaster.NShards; shardNum++ {
+		if kv.isLeavingShard(shardNum, newConfig) {
+			shardsLeaving = append(shardsLeaving, shardNum)
+			kv.shardMigratingKeys[currentConfigNum][shardNum] = make(map[string]KeyMigratingData)
+		}
+		if kv.isAwaitingShard(shardNum, newConfig) {
+			shardsToGet = append(shardsToGet, shardNum)
+			kv.shardAwaitingData[shardNum] = true
+		}
+	}
+	DPrintf("[KV GID %d Server %d] Shards to Get: %v, Shards leaving: %v\n", kv.gid, kv.me, shardsToGet, shardsLeaving)
 
-	// for k, v := range kv.kvMapper {
-	// 	isKeyLeaving, shard := keyBelongsToMigratingShard(k, shardsLeaving)
-	// 	if !isKeyLeaving {
-	// 		continue
-	// 	}
-	// 	DPrintf("Here3")
-	// 	keyLastReq := kv.keyLastRequestInfo[k]
-	// 	kv.shardMigratingKeys[newConfig.Num][shard][k] = KeyMigratingData{v, keyLastReq.RequestId, keyLastReq.ClientId}
-	// 	delete(kv.kvMapper, k)
-	// 	delete(kv.keyLastRequestInfo, k)
-	// }
+	for k, v := range kv.kvMapper {
+		isKeyLeaving, shard := keyBelongsToMigratingShard(k, shardsLeaving)
+		if !isKeyLeaving {
+			continue
+		}
 
+		clientLastRequestIds := make(map[int64]int64)
+		for clientId, reqId := range kv.keyClientLastRequestId[k] {
+			clientLastRequestIds[clientId] = reqId
+		}
+		DPrintf("[KV GID %d Server %d] CurrentConfig %d Key Leaving %v\n", kv.gid, kv.me, kv.config.Num, k)
+		kv.shardMigratingKeys[currentConfigNum][shard][k] = KeyMigratingData{v, clientLastRequestIds}
+		delete(kv.kvMapper, k)
+		delete(kv.keyClientLastRequestId, k)
+	}
+	kv.mu.Unlock()
+
+	configChan := make(chan bool)
+
+	go kv.fetchMissingShards(shardsToGet, configChan, newConfig)
+
+	// Wait until required shards are fetched
+	<-configChan
+	kv.mu.Lock()
+	kv.isMigrating = false
 	kv.config.Num = newConfig.Num
 	DPrintf("[KV GID %d Server %d] New Config: %v\n", kv.gid, kv.me, kv.config.Num)
 	copy(kv.config.Shards[:], newConfig.Shards[:shardmaster.NShards])
@@ -227,8 +266,8 @@ func (kv *ShardKV) handleConfigChange(newConfig shardmaster.Config) {
 	for k, v := range newConfig.Groups {
 		kv.config.Groups[k] = v
 	}
+	kv.mu.Unlock()
 
-	// kv.fetchMissingShards(shardsToGet)
 }
 
 // Check if ShardGroup is waiting to receive data for any shard
@@ -243,32 +282,36 @@ func (kv *ShardKV) isAwaitingAnyShard() bool {
 	return false
 }
 
+func (kv *ShardKV) getNextConfigNum() int {
+	kv.mu.Lock()
+	ret := kv.config.Num + 1
+	kv.mu.Unlock()
+	return ret
+}
+
 func (kv *ShardKV) detectConfigChange() {
 	for {
 		time.Sleep(100 * time.Millisecond)
 		if !kv.isLeader() {
 			continue
 		}
-		fetchedConfig := kv.sm.Query(-1)
+		nextConfigNum := kv.getNextConfigNum()
+		DPrintf("[KV GID %d Server %d] NextConfig: %v\n", kv.gid, kv.me, nextConfigNum)
+		fetchedConfig := kv.sm.Query(nextConfigNum)
 		kv.mu.Lock()
 		// DPrintf("Detect Config Acquired lock")
-		currentConfigNum := kv.config.Num
 		isMigrating := kv.isMigrating
 		kv.mu.Unlock()
 		// DPrintf("Detect Config Released lock")
-		if !isMigrating && fetchedConfig.Num > currentConfigNum && !kv.isAwaitingAnyShard() && kv.isLeader() {
+		DPrintf("[KV GID %d Server %d] Is Migrating: %v\n", kv.gid, kv.me, isMigrating)
+		if !isMigrating && fetchedConfig.Num == nextConfigNum && kv.isLeader() {
 			// kv.handleConfigChange(&fetchedConfig)
 			op := Op{}
 			op.Type = CONFIG_CHANGE
 			op.NewConfing = getConfigCopy(fetchedConfig)
 
-			// If not leader Start will be rejected by Raft
-			DPrintf("[KV GID %d Server %d] ConfigChange Calling Start, from %v to %v", kv.gid, kv.me, currentConfigNum, op.NewConfing.Num)
-			index, _, isLeader := kv.rf.Start(op)
-			DPrintf("[KV GID %d Server %d] ConfigChange Start Finish", kv.gid, kv.me)
-			if isLeader {
-				DPrintf("[KV GID %d Server %d isLeader] ChangeConfig index %v\n", kv.gid, kv.me, index)
-			}
+			kv.rf.Start(op)
+
 			time.Sleep(100 * time.Millisecond)
 		}
 
@@ -295,15 +338,30 @@ func (kv *ShardKV) receiveApply() {
 		}
 
 		kv.mu.Lock()
+
+		if kv.isMigrating {
+			DPrintf("[KV GID %d Server %d] Cannot apply message op %v, server migrating ... \n", kv.gid, kv.me, op)
+			kv.mu.Unlock()
+			continue
+		}
+
 		// defer kv.mu.Unlock()
 		kv.lastAppliedIndex = index
 		kv.lastAppliedTerm = term
 
 		if msgType == CONFIG_CHANGE {
-			kv.handleConfigChange(newConfig)
+			kv.isMigrating = true
+			go kv.handleConfigChange(newConfig)
 			kv.mu.Unlock()
 			continue
 		}
+
+		// Check if configuration changed, before applying Get/PutAppend
+		if op.ConfigNum != kv.config.Num || kv.isMigrating {
+			kv.mu.Unlock()
+			continue
+		}
+
 		ignore := false
 
 		if clientLastRequest, found := kv.clientsLastRequest[clientId]; found {
@@ -314,7 +372,10 @@ func (kv *ShardKV) receiveApply() {
 		DPrintf("Applying msgType: %v, K: %v, V: %v\n", msgType, op.Key, op.Value)
 		if !ignore {
 			kv.clientsLastRequest[clientId] = requestId
-			kv.keyLastRequestInfo[op.Key] = KeyLastRequestInfo{requestId, clientId}
+			if _, found := kv.keyClientLastRequestId[op.Key]; !found {
+				kv.keyClientLastRequestId[op.Key] = make(map[int64]int64)
+			}
+			kv.keyClientLastRequestId[op.Key][clientId] = requestId
 
 			if msgType == GET {
 				response = Response{OK}
@@ -363,18 +424,12 @@ func (kv *ShardKV) getOpConfirmationWithTimeout(indexId IndexId) Response {
 	return ret
 }
 
-func (kv *ShardKV) checkRequestError(shardNum int, configNum int) Err {
+func (kv *ShardKV) checkValidRequest(shardNum int, configNum int) Err {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 	DPrintf("[KV GID %d Server %d] Checking ShardNum %v ConfigNum %v\n", kv.gid, kv.me, shardNum, configNum)
 	DPrintf("[KV GID %d Server %d] Current Config %v Shard belogs to GID %v\n", kv.gid, kv.me, kv.config.Num, kv.gid)
-	if configNum != kv.config.Num || kv.gid != kv.config.Shards[shardNum] {
-		DPrintf("Rejected 1\n")
-		return ErrWrongGroup
-	}
-
-	// Not yet received the shard
-	if isWaiting, found := kv.shardAwaitingData[shardNum]; found && isWaiting {
+	if configNum != kv.config.Num || kv.gid != kv.config.Shards[shardNum] || kv.isMigrating {
 		return ErrWrongGroup
 	}
 
@@ -384,15 +439,22 @@ func (kv *ShardKV) checkRequestError(shardNum int, configNum int) Err {
 func (kv *ShardKV) RequestShards(args *GetShardsArgs, reply *GetShardsReply) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
+	DPrintf("[KV GID %d Server %d] Received RequestShards, CurrentConfig %v, RequestConfig %v RequestedShards %v\n", kv.gid, kv.me, kv.config.Num, args.ConfigNum, args.Shards)
+
+	if args.ConfigNum > kv.config.Num {
+		reply.Err = ErrNoConfig
+		return
+	}
+
+	reply.ConfigNum = args.ConfigNum
+	reply.Err = OK
+	reply.Data = make(map[string]KeyMigratingData)
 
 	shardsMap, found := kv.shardMigratingKeys[args.ConfigNum]
 	if !found {
 		reply.Err = ErrNoConfig
 		return
 	}
-	reply.ConfigNum = args.ConfigNum
-	reply.Err = OK
-	reply.Data = make(map[string]KeyMigratingData)
 
 	for _, shardData := range shardsMap {
 		for k, v := range shardData {
@@ -403,14 +465,15 @@ func (kv *ShardKV) RequestShards(args *GetShardsArgs, reply *GetShardsReply) {
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
-	DPrintf("[KV GID %d Server %d] Received Get for Key: %v\n", kv.gid, kv.me, args.Key)
-	// if err := kv.checkRequestError(args.ShardNum, args.ConfigNum); err != OK {
-	// 	reply.Err = err
-	// 	return
-	// }
+	DPrintf("[KV GID %d Server %d] Received Get for Key: %v, ConfigNum %v\n", kv.gid, kv.me, args.Key, args.ConfigNum)
+	if err := kv.checkValidRequest(args.ShardNum, args.ConfigNum); err != OK {
+		reply.Err = err
+		return
+	}
 	op := Op{}
 	op.Key = args.Key
 	op.Type = GET
+	op.ConfigNum = args.ConfigNum
 	op.RequestId = args.RequestId
 	op.ClientId = args.ClientId
 
@@ -427,7 +490,7 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 
 	response := kv.getOpConfirmationWithTimeout(indexId)
 	ret := ""
-	reply.Err = ErrWrongLeader
+	reply.Err = ErrWrongGroup
 
 	if response.Err != OK {
 		return
@@ -436,6 +499,12 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	DPrintf("[KV GID %d Server %d] Getting Value for Key: %v\n", kv.gid, kv.me, args.Key)
 
 	kv.mu.Lock()
+	// if args.ConfigNum != kv.config.Num {
+	// 	DPrintf("[KV GID %d Server %d] Getting Value for Key: %v failed because of config change\n", kv.gid, kv.me, args.Key)
+	// 	reply.Err = ErrWrongGroup
+	// 	kv.mu.Unlock()
+	// 	return
+	// }
 	ret, ok := kv.kvMapper[args.Key]
 	DPrintf("[KV GID %d Server %d] Ok %v Key %v Value %v", kv.gid, kv.me, ok, args.Key, ret)
 	kv.mu.Unlock()
@@ -453,14 +522,15 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
 	DPrintf("[KV GID %d Server %d] Received PutAppend for Key %v, value %v", kv.gid, kv.me, args.Key, args.Value)
-	// if err := kv.checkRequestError(args.ShardNum, args.ConfigNum); err != OK {
-	// 	reply.Err = err
-	// 	return
-	// }
+	if err := kv.checkValidRequest(args.ShardNum, args.ConfigNum); err != OK {
+		reply.Err = err
+		return
+	}
 	op := Op{}
 	op.Key = args.Key
 	op.Value = args.Value
 	op.Type = args.Op
+	op.ConfigNum = args.ConfigNum
 	op.ClientId = args.ClientId
 	op.RequestId = args.RequestId
 	op.NewConfing = shardmaster.Config{}
@@ -557,7 +627,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.kvMapper = make(map[string]string)
 	kv.indextoChMapper = make(map[IndexId]chan Response)
 	kv.clientsLastRequest = make(map[int64]int64)
-	kv.keyLastRequestInfo = make(map[string]KeyLastRequestInfo)
+	kv.keyClientLastRequestId = make(map[string]map[int64]int64)
 	kv.shardAwaitingData = make(map[int]bool)
 	kv.shardMigratingKeys = make(map[int]map[int]map[string]KeyMigratingData)
 
